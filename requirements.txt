@@ -1,0 +1,27 @@
+# Gesture Engine + Overlay Dependencies
+# ─────────────────────────────────────────────────────────────────────────────
+# Requires Python 3.11  (mediapipe has NO wheels for 3.12+ on linux/aarch64)
+#
+# Raspberry Pi / DietPi (aarch64) — run setup_pi.sh instead of this directly.
+# The script installs Python 3.11, creates a fresh venv, and pulls the
+# pre-built mediapipe aarch64 wheel from the community mirror.
+#
+# x86-64 Linux / Windows / macOS:
+#   pip install -r requirements.txt
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Use headless OpenCV on Pi (avoids pulling in GTK/Qt display libs)
+opencv-python-headless>=4.9.0,<4.11.0
+
+# mediapipe 0.10.14 is the last release with aarch64 community wheels
+# The aarch64 .whl is installed by setup_pi.sh; on x86-64 PyPI works fine.
+mediapipe>=0.10.14,<0.11.0
+
+websockets>=12.0,<14.0
+
+# OS mouse cursor + click injection (gesture_engine.py Option A)
+pynput>=1.7.0
+
+# PyQt5 — overlay.py only; skip if you don't need the overlay on the Pi
+# (apt install python3-pyqt5 is faster than pip on Debian/DietPi)
+PyQt5>=5.15.0
