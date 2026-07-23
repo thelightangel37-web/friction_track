@@ -1,2070 +1,2796 @@
 """
+
 gesture_engine.py
+
 =================
+
 Background gesture-detection engine for a Raspberry Pi kiosk.
 
 - Captures frames from the default webcam using OpenCV.
+
 - Uses MediaPipe Hands to track a single hand (supports tilted / downward palms).
+
 - Applies Exponential Moving Average (EMA) smoothing to eliminate jitter.
+
 - Detects CLICK/PINCH and SWIPE_LEFT/SWIPE_RIGHT gestures.
+
 - Broadcasts real-time JSON (cursor + all 21 landmarks) over WebSocket (localhost:8765).
+
   The overlay.py process reads this to render the hand skeleton over the kiosk UI.
 
 No GUI / cv2.imshow — fully headless.
 
 MediaPipe compatibility
+
 -----------------------
+
   < 0.10  →  mp.solutions.hands  (legacy API, model_complexity=1 for accuracy)
+
   >= 0.10 →  mediapipe.tasks     (Tasks API, auto-downloads model on first run)
 
 Dependencies:
+
     pip install opencv-python mediapipe websockets
 
 Usage:
+
     python gesture_engine.py
+
 """
 
 from __future__ import annotations
 
 import asyncio
+
 import json
-import queue
+
 import logging
+
 import math
+
 import os
+
 import platform
+
 import subprocess
+
 import threading
+
 import time
+
 import sys
-import shutil
+
 import urllib.request
+
+import queue
+
 from collections import deque
-from typing import List, Optional
+
+from typing import List, Optional, Any
 
 import cv2
+
 cv2.setNumThreads(2)
+
 import numpy as np
 
-import depth_metrics
-
 # ===========================================================================
+
 # ── MediaPipe API Detection ───────────────────────────────────────────────
+
 # ===========================================================================
 
 try:
+
     import mediapipe as mp
 
-    if hasattr(mp, "solutions") and hasattr(mp.solutions, "hands"):
-        _USE_TASKS_API = False
-        _hands_mod = mp.solutions.hands
-        _api_label = "legacy solutions API"
-    else:
-        raise AttributeError("solutions namespace missing")
+    _api_label = "Tasks API (0.10+)"
 
-except AttributeError:
-    try:
-        import mediapipe as mp
-        _USE_TASKS_API = True
-        _api_label = "Tasks API (0.10+)"
-    except ImportError as exc:
-        raise SystemExit(
-            f"mediapipe import failed: {exc}\n"
-            "Install with:  pip install mediapipe"
-        ) from exc
+except ImportError as exc:
 
-except ModuleNotFoundError as exc:
     raise SystemExit(
+
         f"mediapipe is not installed: {exc}\n"
+
         "Install with:  pip install mediapipe"
+
     ) from exc
 
 import websockets
 
 # ===========================================================================
+
 # ── Logging ───────────────────────────────────────────────────────────────
+
 # ===========================================================================
 
 logging.basicConfig(
+
     level=logging.INFO,
+
     format="%(asctime)s [%(levelname)s] %(message)s",
+
     datefmt="%H:%M:%S",
+
 )
+
 log = logging.getLogger("gesture_engine")
+
 log.info("MediaPipe: %s", _api_label)
 
 # ===========================================================================
+
 # ── pynput — OS mouse control (optional) ─────────────────────────────────
-# ===========================================================================
-
-class AsyncMouse:
-    def __init__(self):
-        self.x = -1
-        self.y = -1
-        try:
-            from pynput.mouse import Controller
-            self._mouse = Controller()
-        except ImportError:
-            self._mouse = None
-            log.warning("pynput not installed. OS mouse control disabled.")
-
-    def set_position(self, x: int, y: int) -> None:
-        if self._mouse is None:
-            return
-        self.x, self.y = x, y
-        try:
-            self._mouse.position = (x, y)
-        except Exception:
-            pass
-
-async_mouse = AsyncMouse()
 
 # ===========================================================================
+
+try:
+
+    from pynput.mouse import Button as _Button, Controller as _MouseController
+
+    _PYNPUT_AVAILABLE = True
+
+    log.info("pynput available — OS mouse control enabled.")
+
+except ImportError:
+
+    _PYNPUT_AVAILABLE = False
+
+    _Button          = None   # type: ignore[assignment]
+
+    _MouseController = None   # type: ignore[assignment]
+
+    log.warning(
+
+        "pynput not installed — OS cursor/click injection disabled.\n"
+
+        "  Install with:  pip install pynput"
+
+    )
+
+# ===========================================================================
+
 # ── CONFIGURATION ─────────────────────────────────────────────────────────
+
 # ===========================================================================
 
 # ── Display Orientation / Auto-Detection ──────────────────────────────────────
+
 # Fallback orientation if dynamic OS detection fails.
+
 DISPLAY_ORIENTATION: str = "portrait"
+
 _BASE_SHORT: int = 1080
+
 _BASE_LONG:  int = 1920
 
 # ── Camera Hardware ─────────────────────────────────────────────────────────
+
 CAMERA_INDEX:  int = 0
+
 CAMERA_WIDTH:  int = 640
+
 CAMERA_HEIGHT: int = 480
-TARGET_FPS:    int = 30
-CAMERA_ROTATION: int = 0
+
+TARGET_FPS:    int = 60
 
 # ── Camera Ergonomic Margins (Phase 2) ──────────────────────────────────────
+
 # Defines the maximum percentage of the camera's field of view to use for 
+
 # cursor movement (0.0 to 1.0). 
+
 # - A smaller number means a FASTER cursor (less hand movement required).
+
 # - A larger number means a SLOWER, more precise cursor.
+
 # - Do NOT use 1.0, or you will have to reach the extreme edges of the camera 
+
 #   where hand tracking is unreliable. A value of 0.80 leaves a 10% deadzone 
+
 #   on each side.
 
 CAMERA_MARGINS = {
+
     "landscape": {
-        "x": 0.60,  # 60% of width (requires less physical horizontal sweep)
-        "y": 0.45   # 45% of height (comfortable vertical reach)
+
+        "x": 0.80,  # 80% of width (leaves a safe cushion, prevents clipping)
+
+        "y": 0.60   # 60% of height (comfortable vertical reach)
+
     },
+
     "portrait": {
-        "x": 0.40,  # 40% of width (lighter movement horizontally)
-        "y": 0.60   # 60% of height (safe cushion for reaching top/bottom)
+
+        "x": 0.50,  # 50% of width (slower, highly precise horizontal movement)
+
+        "y": 0.80   # 80% of height (safe cushion for reaching top/bottom)
+
     }
+
 }
 
 def _detect_linux_geometry() -> tuple:
+
     """
+
     Parse ``xrandr --verbose`` to get the connected display's active resolution
+
     AND rotation.  Returns (width, height, rotation_degrees) on success,
+
     or (0, 0, 0) on failure.
 
     xrandr --verbose reports the active mode dimensions ALREADY swapped when
+
     the display is rotated (e.g. a 1920x1080 panel in "left" rotation appears
+
     as 1080x1920).  The rotation keyword is on the same "connected" line:
+
         HDMI-1 connected primary 720x1280+0+0 (0x45) left (...)
 
     Rotation keyword  → angle
+
         normal        →   0
+
         left          →  90   (CCW from panel default → content rotated 90 CW)
+
         inverted      → 180
+
         right         → -90   (CW from panel default → content rotated 90 CCW)
 
     Works on DietPi / Raspberry Pi OS with X11 or XWayland.
+
     """
+
     if platform.system() == "Windows":
+
         return 0, 0, 0
-    if not shutil.which("xrandr"):
-        return 0, 0, 0
+
     try:
+
         env = dict(os.environ)
+
         env.setdefault("DISPLAY", ":0")
+
         r = subprocess.run(
+
             ["xrandr", "--verbose"],
+
             capture_output=True, text=True, timeout=3, env=env,
+
         )
+
         _ROTATION_MAP = {
+
             "normal":   0,
+
             "left":    90,
+
             "inverted": 180,
+
             "right":   -90,
+
         }
+
         for line in r.stdout.splitlines():
+
             if " connected" not in line:
+
                 continue
+
             # Parse geometry token: "720x1280+0+0" or "1280x720+0+0"
+
             w, h = 0, 0
+
             for token in line.split():
+
                 if "x" in token and "+" in token:
+
                     res = token.split("+")[0]
+
                     parts = res.split("x")
+
                     if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+
                         w, h = int(parts[0]), int(parts[1])
+
                         break
+
             # Parse rotation keyword on the same line
+
             rotation = 0
+
             for kw, angle in _ROTATION_MAP.items():
+
                 # Match whole word only — "normal" must not match "(normal"
+
                 if f" {kw} " in f" {line} ":
+
                     rotation = angle
+
                     break
+
             if w > 0 and h > 0:
+
                 return w, h, rotation
+
     except Exception:
+
         pass
+
     return 0, 0, 0
 
-
 class _SimpleEMA:
+
     def __init__(self, alpha: float):
+
         self.alpha = alpha
+
         self.val = None
+
     def update(self, new_val: float) -> float:
+
         if self.val is None:
+
             self.val = new_val
+
         else:
+
             self.val = self.alpha * new_val + (1.0 - self.alpha) * self.val
+
         return self.val
 
+class OneEuroFilter:
+
+    def __init__(self, min_cutoff=0.8, beta=1.5, d_cutoff=1.0):
+
+        self.min_cutoff = min_cutoff
+
+        self.beta = beta
+
+        self.d_cutoff = d_cutoff
+
+        self.x_prev = None
+
+        self.dx_prev = None
+
+        self.t_prev = None
+
+    def __call__(self, t: float, x: np.ndarray) -> np.ndarray:
+
+        if self.t_prev is None:
+
+            self.x_prev = x.copy()
+
+            self.dx_prev = np.zeros_like(x)
+
+            self.t_prev = t
+
+            return self.x_prev
+
+        te = t - self.t_prev
+
+        if te <= 0.0:
+
+            return self.x_prev
+
+        # The filtered derivative of the signal.
+
+        ad = self._alpha(te, self.d_cutoff)
+
+        dx = (x - self.x_prev) / te
+
+        dx_hat = ad * dx + (1.0 - ad) * self.dx_prev
+
+        # The filtered signal.
+
+        cutoff = self.min_cutoff + self.beta * np.linalg.norm(dx_hat)
+
+        a = self._alpha(te, cutoff)
+
+        x_hat = a * x + (1.0 - a) * self.x_prev
+
+        self.x_prev = x_hat
+
+        self.dx_prev = dx_hat
+
+        self.t_prev = t
+
+        return x_hat
+
+    def _alpha(self, te, cutoff):
+
+        tau = 1.0 / (2.0 * math.pi * cutoff)
+
+        return te / (te + tau)
 
 class DisplayManager:
+
     """
+
     Centralized geometry manager.
 
     Geometry source of truth (in priority order):
+
       1. overlay.py pushes Qt-verified geometry via set_external_geometry()
+
          (authoritative on all platforms).  Rotation is re-detected from xrandr
+
          on every geometry push so live display-rotation changes are handled.
+
       2. On Linux, _detect_linux_geometry() queries xrandr at startup for both
+
          resolution AND rotation so the engine starts correctly.
+
       3. On Windows, update() polls via GetSystemMetrics for local dev/testing.
+
          Rotation is always 0 on Windows (dev machines are not rotated).
+
       4. DISPLAY_ORIENTATION / _BASE_* constants are the last-resort fallback.
+
     """
+
     def __init__(self):
+
         self._lock = threading.Lock()
+
         self.rotation: int = 0   # degrees: 0, 90, -90, or 180 — auto-detected
 
         # ── Step 1: static fallback (safe non-zero placeholder) ────────────
+
         if DISPLAY_ORIENTATION == "portrait":
+
             self.target_width, self.target_height = _BASE_SHORT, _BASE_LONG
-            self.rotation = 90
+
         else:
+
             self.target_width, self.target_height = _BASE_LONG, _BASE_SHORT
-            self.rotation = 0
 
         # ── Step 2: Linux auto-detection via xrandr ───────────────────────────
+
         # xrandr --verbose returns ALREADY-SWAPPED dimensions when the display
+
         # is rotated (e.g. "720x1280" for a 1280x720 panel rotated "left").
+
         # We take those swapped dimensions directly as target_width/height, and
+
         # store the rotation angle so GestureProcessor can rotate camera coords.
+
         if platform.system() != "Windows":
+
             xr_w, xr_h, xr_rot = _detect_linux_geometry()
+
             if xr_w > 0 and xr_h > 0:
+
                 self.target_width  = xr_w
+
                 self.target_height = xr_h
+
                 self.rotation      = xr_rot
+
                 log.info(
+
                     "Display detected via xrandr: %dx%d  rotation=%d°",
+
                     xr_w, xr_h, xr_rot,
+
                 )
+
             else:
+
                 log.warning(
+
                     "xrandr detection failed — using static fallback %dx%d. "
+
                     "overlay.py will push the correct geometry on connect.",
+
                     self.target_width, self.target_height,
+
                 )
 
         self.active_x_min: float = 0.0
+
         self.active_x_max: float = 1.0
+
         self.active_y_min: float = 0.0
+
         self.active_y_max: float = 1.0
+
         self.scale_x: float = 0.0
+
         self.scale_y: float = 0.0
+
         self._base_ax_range: float = 1.0
+
         self._base_ay_range: float = 1.0
+
         
-        self._bound_emas = {
-            'xmin': _SimpleEMA(0.25),
-            'xmax': _SimpleEMA(0.25),
-            'ymin': _SimpleEMA(0.25),
-            'ymax': _SimpleEMA(0.25),
-        }
+
         self._recompute_margins()
 
     def _recompute_margins(self) -> None:
+
         """Shared math: derive symmetric active-region bounds from the
+
         current target_width/target_height. Called any time geometry changes,
+
         from whichever source (Windows polling or overlay.py's push)."""
+
         if self.target_width == 0 or self.target_height == 0:
+
             return
 
         orientation = "landscape" if self.target_width > self.target_height else "portrait"
+
         margins = CAMERA_MARGINS.get(orientation, CAMERA_MARGINS["landscape"])
 
         _ax_range = margins["x"]
+
         
+
         # ── DYNAMIC ASPECT RATIO ADAPTATION ──
+
         # Computes Y margin to perfectly match the display's aspect ratio.
+
         # This guarantees 1:1 physical-to-screen movement (isotropic scaling)
+
         # without stretching, on any display or orientation.
+
         _ay_range = (_ax_range * CAMERA_WIDTH * self.target_height) / (CAMERA_HEIGHT * self.target_width)
+
         
+
         # If the requested Y margin exceeds the camera's FOV (e.g. very tall screen),
+
         # clamp it and shrink the X margin instead to maintain perfect proportions.
+
         if _ay_range > 0.95:
+
             _ay_range = 0.95
+
             _ax_range = (_ay_range * CAMERA_HEIGHT * self.target_width) / (CAMERA_WIDTH * self.target_height)
 
         # Bounds are always derived symmetrically from the margin — the
+
         # margin is a WIDTH around center, never a raw max. Keeping this in
+
         # one helper prevents the classic bug where a margin value gets used
+
         # directly as a one-sided max, silently pushing the whole deadzone
+
         # onto one edge.
+
         with self._lock:
+
             self._base_ax_range = _ax_range
+
             self._base_ay_range = _ay_range
+
             self.active_x_min = round((1.0 - _ax_range) / 2, 4)
+
             self.active_x_max = round(1.0 - self.active_x_min, 4)
+
             self.active_y_min = round((1.0 - _ay_range) / 2, 4)
+
             self.active_y_max = round(1.0 - self.active_y_min, 4)
 
             self.scale_x = round(self.target_width  / _ax_range, 2) if _ax_range else 0.0
+
             self.scale_y = round(self.target_height / _ay_range, 2) if _ay_range else 0.0
 
         log.info(f"Geometry Update: {orientation.upper()} {self.target_width}x{self.target_height}")
+
         log.info(f" -> Camera Size: {CAMERA_WIDTH}x{CAMERA_HEIGHT}")
+
         log.info(f" -> Active Margins: X={_ax_range:.2f}, Y={_ay_range:.2f}")
+
         log.info(f" -> Active Min/Max: X[{self.active_x_min:.3f}, {self.active_x_max:.3f}], Y[{self.active_y_min:.3f}, {self.active_y_max:.3f}]")
+
         log.info(f" -> Engine Scales: scale_x={self.scale_x}, scale_y={self.scale_y}")
 
     def get_snapshot(self) -> dict:
-        with self._lock:
-            return {
-                'active_x_min': self.active_x_min,
-                'active_x_max': self.active_x_max,
-                'active_y_min': self.active_y_min,
-                'active_y_max': self.active_y_max,
-                'target_width': self.target_width,
-                'target_height': self.target_height,
-                'scale_x': self.scale_x,
-                'scale_y': self.scale_y,
-                'rotation': self.rotation
-            }
 
-    def get_depth_adjusted_bounds(self, hand_size: float, ref_size: float) -> dict:
-        """
-        Dynamically adjusts the active tracking bounds based on hand depth.
-        Window always centered at (0.5, 0.5) — no recentering drift.
-        Bounds are smoothed via EMA to prevent jitter.
-        """
         with self._lock:
-            # Flip the z-ratio: close (large size) = large z, far (small size) = small z
-            z = hand_size / max(0.001, ref_size)
-            
-            # Lock tracking window size (do not scale with depth 'z').
-            # Prevents rubber-banding and erratic sensitivity when hand closes (z drops falsely).
-            ax = self._base_ax_range
-            ay = self._base_ay_range
-            
-            # Fixed center at (0.5, 0.5) — no rubber-band recentering
-            raw_xmin = 0.5 - ax / 2.0
-            raw_xmax = 0.5 + ax / 2.0
-            raw_ymin = 0.5 - ay / 2.0
-            raw_ymax = 0.5 + ay / 2.0
-            
-            # Bounds Smoothing / Hysteresis
+
             return {
-                'active_x_min': self._bound_emas['xmin'].update(raw_xmin),
-                'active_x_max': self._bound_emas['xmax'].update(raw_xmax),
-                'active_y_min': self._bound_emas['ymin'].update(raw_ymin),
-                'active_y_max': self._bound_emas['ymax'].update(raw_ymax),
+
+                'active_x_min': self.active_x_min,
+
+                'active_x_max': self.active_x_max,
+
+                'active_y_min': self.active_y_min,
+
+                'active_y_max': self.active_y_max,
+
                 'target_width': self.target_width,
-                'target_height': self.target_height
+
+                'target_height': self.target_height,
+
+                'scale_x': self.scale_x,
+
+                'scale_y': self.scale_y
+
             }
 
     def set_external_geometry(self, w: int, h: int) -> bool:
+
         """
+
         Authoritative geometry push from overlay.py (Qt-verified — correct on
+
         Linux/X11/Wayland). This is the PRIMARY path on the Raspberry Pi kiosk.
 
         Also re-queries xrandr for the current rotation so that a live display
+
         rotation (e.g. user rotates the screen while the kiosk is running) is
+
         picked up immediately without restarting the engine.
 
         Returns True if geometry or rotation actually changed.
+
         """
+
         if w <= 0 or h <= 0:
+
             return False
 
         # Re-detect rotation from the live xrandr state every time the overlay
+
         # pushes geometry (i.e. on connect and on every screen-geometry change).
+
         # This is cheap (one subprocess call) and is the single place where
+
         # rotation can be updated at runtime without a restart.
+
         new_rotation = self.rotation
+
         if platform.system() != "Windows":
+
             _, _, xr_rot = _detect_linux_geometry()
+
             new_rotation = xr_rot
-            
-            # Wayland (e.g. Raspberry Pi OS Bookworm) often reports rotation=0 
-            # via xrandr even when physically rotated. If the overlay pushes a 
-            # portrait geometry but xrandr says 0, infer 90 degrees.
-            if new_rotation == 0 and h > w:
-                new_rotation = 90
-            
+
+        # xrandr already reports swapped dimensions when the display is rotated,
+
+        # so w/h from the overlay are the "visual" dims — use them directly.
+
         changed = False
+
         with self._lock:
+
             if w != self.target_width or h != self.target_height or new_rotation != self.rotation:
+
                 changed = True
-                
-                if new_rotation != self.rotation:
-                    log.info("Display rotation changed: %d°", new_rotation)
-                
+
                 self.target_width  = w
+
                 self.target_height = h
+
                 self.rotation      = new_rotation
 
         if changed:
+
+            if new_rotation != self.rotation:
+
+                log.info("Display rotation changed: %d°", new_rotation)
+
             self._recompute_margins()
+
         return changed
 
     def update(self) -> bool:
+
         """
+
         Windows-only convenience path (e.g. local dev/testing off-Pi).
+
         Returns True if geometry changed. Guaranteed no-op on any non-Windows
+
         platform — it will NOT overwrite geometry pushed by overlay.py with
+
         a hardcoded fallback; it simply does nothing.
+
         """
+
         if platform.system() != "Windows":
+
             return False
 
         with self._lock:
+
             prev_w, prev_h = self.target_width, self.target_height
 
         w, h = 0, 0
+
         try:
+
             import ctypes
+
             user32 = ctypes.windll.user32
+
             # SM_CXSCREEN / SM_CYSCREEN — the PRIMARY monitor only.
+
             # (Deliberately not SM_CXVIRTUALSCREEN/SM_CYVIRTUALSCREEN: on a
+
             # multi-monitor dev box those report the bounding box of ALL
+
             # monitors combined, which inflates target_width and reproduces
+
             # this exact "can't reach the true right edge" bug on Windows too.)
+
             w = user32.GetSystemMetrics(0)
+
             h = user32.GetSystemMetrics(1)
+
         except Exception:
+
             pass
 
         if w == 0 or h == 0:
+
             # Detection failed this cycle — keep the last known-good geometry
+
             # rather than resetting to a static, possibly-wrong fallback.
+
             return False
 
-        new_rotation = 90 if h > w else 0
-
         with self._lock:
-            if w == prev_w and h == prev_h and new_rotation == self.rotation:
+
+            if w == prev_w and h == prev_h:
+
                 return False
 
             self.target_width = w
+
             self.target_height = h
-            self.rotation = new_rotation
+
+            
+
         self._recompute_margins()
+
         return True
 
 display_manager = DisplayManager()
 
+# ── Tracking Filter ───────────────────────────────────────────────────────
 
-# ── Cursor Smoothing — One Euro Filter ────────────────────────────────────────────
-# Adaptive low-pass filter: still positions get heavy smoothing, fast
-# movements pass through with minimal lag.
-# Ref: Casiez et al., "1€ Filter", CHI 2012.
-#
-# Tuned for Index Finger Tip (LM8).
-#
-#   OEF_MIN_CUTOFF  — Hz. Lower → smoother at rest, less micro-jitter.
-#   OEF_BETA        — speed coeff. Higher → snappier tracking on fast moves.
-#
-OEF_MIN_CUTOFF: float = 0.4   # lower = highly stable at rest (great for dwell aiming)
-OEF_BETA:       float = 5.0    # higher = snaps instantly to fast hand movements
-OEF_D_CUTOFF:   float = 1.0    # Hz — derivative filter (rarely needs changing)
+# Vectorized Kalman filter parameters.
 
-# ── Pointing Mode Stabilization ───────────────────────────────────────────
-# When the index finger is extended and other fingers are curled, the cursor
-# tip (LM 8) is the noisiest landmark due to angular amplification from the
-# palm→finger chain. Two mechanisms combine to fix this:
-#
-# 1. GEOMETRIC ANCHOR BLEND: cursor reads from a weighted point between the
-#    fingertip (LM 8) and the index MCP knuckle (LM 5). This is a small
-#    bias correction — NOT the primary stabilizer. It targets specifically
-#    joint-angle jitter, where LM 8 moves relative to LM 5. Whole-hand
-#    translation (both points move together) passes through at full gain.
-#    NOTE: this intentionally reduces fingertip aiming precision by ~12%
-#    in exchange for eliminating ~80% of rest-state jitter.
-#    alpha=1.0 → pure tip (no change), alpha=0.0 → pure knuckle.
-#
-# 2. OEF RETUNE: the primary stabilization. Pointing-specific min_cutoff
-#    and beta are used instead of the default values, applied with a slow
-#    EMA gate to prevent the filter params themselves from oscillating.
-#
-POINTING_ANCHOR_ALPHA: float   = 0.88   # small geometric bias: tip-weighted, not knuckle-heavy
-POINTING_OEF_MIN_CUTOFF: float = 0.35   # lower rest cutoff → more aggressive jitter suppression (tuned up slightly for responsiveness)
-POINTING_OEF_BETA: float       = 4.5    # lower speed coeff → calmer, less rubber-band on fast moves (tuned up for snappiness)
+# KF_Q = Process noise (acceleration variance). Higher = snappier, less lag.
 
-# ── Pointing-Mode Hysteresis ──────────────────────────────────────────────
-# Hard boolean mode-switches per-frame are worse than the problem they solve:
-# if the hand is near the curl threshold, is_pointing can flicker frame-to-
-# frame and simultaneously flip the anchor blend, OEF params, and flow mask.
-# These constants enforce a minimum dwell before switching:
-#   POINTING_ENTER_FRAMES — consecutive frames of pointing pose required to
-#                           enter pointing mode. ~5 frames at 30fps = ~170ms.
-#   POINTING_EXIT_FRAMES  — consecutive frames of non-pointing pose required
-#                           to leave pointing mode. Longer = hysteresis.
-#   POINTING_BLEND_FRAMES — number of frames to linearly interpolate the
-#                           anchor alpha and OEF params at mode transitions,
-#                           preventing hard parameter jumps.
-POINTING_ENTER_FRAMES: int = 5
-POINTING_EXIT_FRAMES:  int = 8
-POINTING_BLEND_FRAMES: int = 10
+# KF_R = Measurement noise. Lower = trusts raw input more, less smoothing.
+
+KF_Q: float = 100.0
+
+KF_R: float = 0.001
+
+KF_Q_Z: float = 2.0      # Z is noisier, trust the model more (smoother)
+
+KF_R_Z: float = 0.05     # Z is noisier, trust the measurement less
 
 # ── Overlay landmark smoothing ────────────────────────────────────────────
+
 # Gentle EMA applied to each of the 21 landmarks before sending to the
+
 # overlay renderer — prevents dot flickering without adding noticeable lag.
+
 # Lower alpha = more stable dots, Higher alpha = more responsive/accurate.
-LM_EMA_ALPHA: float = 0.75     # 0.75 = highly responsive: follows fast movements immediately
+
+LM_EMA_ALPHA: float = 0.22     # 0.22 = balanced: stable skeleton structure, still responsive
+
 # ── Dwell-to-Click Detection ──────────────────────────────────────────────
+
 # A click fires when the hand cursor stays within DWELL_RADIUS_PX pixels
+
 # of its starting position for DWELL_DURATION_S seconds.
+
 DWELL_DURATION_S: float  = 1.2    # seconds of stillness required
-DWELL_RADIUS_PX: int     = 30     # max pixel drift before resetting the timer
+
+DWELL_RADIUS_PX: int     = 48     # max pixel drift before resetting the timer (relaxed for natural hover)
+
 DWELL_COOLDOWN_S: float  = 1.5    # seconds to wait after a click before accepting another
 
 # ── Swipe Detection ────────────────────────────────────────────────────────
-SWIPE_HISTORY_LEN: int          = 10
-SWIPE_VELOCITY_THRESHOLD: float = 0.018
-SWIPE_COOLDOWN_FRAMES: int      = 20
-MISS_TOLERANCE_FRAMES: int      = 10     # ~330ms at 30fps grace period for continuity
+
+SWIPE_HISTORY_DURATION_S: float = 0.15   # seconds to keep history
+
+SWIPE_VELOCITY_THRESHOLD: float = 1.0    # normalized units per second
+
+SWIPE_COOLDOWN_S: float         = 0.35   # seconds
+
+MISS_TOLERANCE_S: float         = 0.35   # seconds — bridges 7 frames at 20 FPS
 
 # ── Hand Detection Sensitivity ────────────────────────────────────────────
+
 # IMPORTANT: tracking confidence should be LOWER than (or equal to) detection
+
 # confidence, not higher. MediaPipe only re-runs the (expensive) full-frame
+
 # palm detector when tracking confidence drops below this threshold — set it
+
 # too high and the tracker keeps "losing the lock" on a perfectly good hand,
+
 # forcing a full re-detect every few frames. That's both a CPU/heat spike
+
 # (full-frame search is far costlier than incremental tracking) and the
+
 # direct cause of the hand "jumping" — re-detection finds the hand in a
+
 # slightly different spot than the tracker would have, producing a visible
+
 # snap. Keeping tracking confidence modest keeps the lock stable.
-DETECT_CONFIDENCE: float   = 0.50
-TRACK_CONFIDENCE: float    = 0.55   # increased to drop bad tracking (fists, etc.) faster
-PRESENCE_CONFIDENCE: float = 0.55   # Tasks API equivalent of TRACK_CONFIDENCE
+
+DETECT_CONFIDENCE: float   = 0.60
+
+TRACK_CONFIDENCE: float    = 0.40   # comfortably below detect, per your own note above
+
+PRESENCE_CONFIDENCE: float = 0.40   # Tasks API equivalent of TRACK_CONFIDENCE
 
 # ── WebSocket ──────────────────────────────────────────────────────────────
+
 WS_HOST: str = "localhost"
+
 WS_PORT: int = 8765
 
 # ── Pseudo-3D Physical Mapping ─────────────────────────────────────────────
+
 # Distance-dependent size/velocity correction
-REFERENCE_SIZE: float = 0.15   # baseline palm metric at comfortable distance
-Z_MIN: float          = 0.4    # nearest zoom bound
-Z_MAX: float          = 2.5    # furthest zoom bound
-SIZE_EMA_ALPHA: float = 0.05   # slow time constant for depth metric
 
+REFERENCE_SIZE: float    = 0.15   # baseline palm metric at comfortable distance
 
+REFERENCE_3D_SPAN: float = 0.11   # baseline 3D wrist-to-middle-MCP span (~11cm)
 
+Z_MIN: float             = 0.4    # nearest zoom bound
+
+Z_MAX: float             = 2.5    # furthest zoom bound
+
+SIZE_EMA_ALPHA: float    = 0.05   # slow time constant for depth metric
 
 # ── Model complexity (legacy solutions API only) ───────────────────────────
+
 #   0 = "lite"  — ~3x cheaper than complexity 1, small accuracy trade-off.
+
 #                 Recommended on any Raspberry Pi.
+
 #   1 = "full"  — heavier model, only worth it on desktop-class CPUs.
-MODEL_COMPLEXITY: int = 1   # full model for better closed-fist detection
 
-# ── Motion-Adaptive Frame Skipping ─────────────────────────────────────────
-# Run MediaPipe dynamically based on motion to save CPU/thermal budget.
-# When hand moves > MOTION_THRESHOLD, we use ACTIVE_SKIP_TARGET.
-# When hand is relatively still, we use DWELL_SKIP_TARGET.
-MOTION_THRESHOLD: float   = 3.5
-ACTIVE_SKIP_TARGET: int   = 4
-DWELL_SKIP_TARGET: int    = 8
-
-# ── Optical Flow Drift Prevention ──────────────────────────────────────────
-# Force MediaPipe re-detect every N frames to prevent drift accumulation.
-# At 30fps this means re-detection every ~1 second.
-FLOW_MAX_AGE_FRAMES: int  = 15
-# Max pixel drift any single landmark is allowed from its last MediaPipe
-# position before we force a re-detect. Prevents skeleton stretching from
-# accumulated per-landmark optical flow tracking errors.
-FLOW_DRIFT_CLAMP_PX: float = 10.0
-
-# ── Tier 1: Presence Gate & Idle Mode ──────────────────────────────────────
-# Radically reduce CPU when no one is using the kiosk.
-IDLE_FPS: int = 8
-GATE_RESOLUTION = (160, 120)
-GATE_DIFF_THRESH: int = 25
-GATE_PIXEL_THRESH: int = 500
-IDLE_TIMEOUT_S: float = 1.0
-SAFETY_NET_INTERVAL: float = 2.0
+MODEL_COMPLEXITY: int = 0   # actually lite — matches the Pi recommendation above
 
 # ── System Mouse Control ──────────────────────────────────────────────────
+
 # Set False to keep gesture_engine as a pure WebSocket broadcaster without
+
 # touching the OS cursor (useful when a browser / Electron frontend handles
+
 # its own UI reactions from the WebSocket stream).
+
 ENABLE_SYSTEM_MOUSE: bool = True
 
 # ── Tasks API model ────────────────────────────────────────────────────────
+
 _MODEL_URL  = (
+
     "https://storage.googleapis.com/mediapipe-models/"
+
     "hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
-)
-_MODEL_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task"
+
 )
 
+_MODEL_PATH = os.path.join(
+
+    os.path.dirname(os.path.abspath(__file__)), "hand_landmarker.task"
+
+)
 
 # ===========================================================================
+
 # ── Model download (Tasks API) ────────────────────────────────────────────
+
 # ===========================================================================
 
 def _ensure_model() -> None:
+
     if os.path.exists(_MODEL_PATH):
+
         return
+
     log.info("Downloading hand_landmarker.task (~6 MB) …")
+
     try:
+
         urllib.request.urlretrieve(_MODEL_URL, _MODEL_PATH)
+
         log.info("Model saved to: %s", _MODEL_PATH)
+
     except Exception as exc:
+
         raise SystemExit(
+
             f"Model download failed: {exc}\n"
+
             f"Download manually from:\n  {_MODEL_URL}\n"
+
             f"and place it next to gesture_engine.py as 'hand_landmarker.task'."
+
         ) from exc
 
-
 # ===========================================================================
+
 # ── Shared State ──────────────────────────────────────────────────────────
+
 # ===========================================================================
 
 class GestureState:
+
     """Thread-safe gesture state container."""
+
     def __init__(self) -> None:
+
         self._lock = threading.RLock()
+
         self._hand_detected = False
+
         self._gesture = "NONE"
+
         self._cursor_state = "MOVE"
+
         self._landmarks = []
+
         self._dwell_progress = 0.0
+
         self._cursor_x = 0
+
         self._cursor_y = 0
+
+        self._skel_anchor_x = 0.0
+
+        self._skel_anchor_y = 0.0
+
         self._hand_size = 1.0
+
         self._depth_z = 1.0
-        self._is_pointing = False
+
+        self._hand_pose_mode = "PALM_FACING_CAMERA"
+
+        self._palm_normal = (0.0, 0.0, 1.0)
 
     @property
+
     def hand_detected(self) -> bool:
+
         with self._lock: return self._hand_detected
+
     
+
     @hand_detected.setter
+
     def hand_detected(self, value: bool) -> None:
+
         with self._lock: self._hand_detected = value
+
         
+
     @property
+
     def gesture(self) -> str:
+
         with self._lock: return self._gesture
+
     
+
     @gesture.setter
+
     def gesture(self, value: str) -> None:
+
         with self._lock: self._gesture = value
 
     @property
+
     def state(self) -> str:
+
         with self._lock: return self._cursor_state
 
     @state.setter
+
     def state(self, value: str) -> None:
+
         with self._lock: self._cursor_state = value
 
     @property
+
     def x(self) -> int:
+
         with self._lock: return self._cursor_x
 
     @x.setter
+
     def x(self, value: int) -> None:
+
         with self._lock: self._cursor_x = value
 
     @property
+
     def y(self) -> int:
+
         with self._lock: return self._cursor_y
 
     @y.setter
+
     def y(self, value: int) -> None:
+
         with self._lock: self._cursor_y = value
 
     @property
+
+    def hand_pose_mode(self) -> str:
+
+        with self._lock: return self._hand_pose_mode
+
+    @hand_pose_mode.setter
+
+    def hand_pose_mode(self, value: str) -> None:
+
+        with self._lock: self._hand_pose_mode = value
+
+    @property
+
+    def palm_normal(self) -> tuple[float, float, float]:
+
+        with self._lock: return self._palm_normal
+
+    @palm_normal.setter
+
+    def palm_normal(self, value: tuple[float, float, float]) -> None:
+
+        with self._lock: self._palm_normal = value
+
+    @property
+
+    def skel_anchor_x(self) -> float:
+
+        with self._lock: return self._skel_anchor_x
+
+    @skel_anchor_x.setter
+
+    def skel_anchor_x(self, value: float) -> None:
+
+        with self._lock: self._skel_anchor_x = value
+
+    @property
+
+    def skel_anchor_y(self) -> float:
+
+        with self._lock: return self._skel_anchor_y
+
+    @skel_anchor_y.setter
+
+    def skel_anchor_y(self, value: float) -> None:
+
+        with self._lock: self._skel_anchor_y = value
+
+    @property
+
     def dwell_progress(self) -> float:
+
         with self._lock: return self._dwell_progress
 
     @dwell_progress.setter
+
     def dwell_progress(self, value: float) -> None:
+
         with self._lock: self._dwell_progress = value
+
         
+
     @property
+
     def landmarks(self) -> List[List[float]]:
+
         with self._lock: return list(self._landmarks)
+
         
+
     @landmarks.setter
+
     def landmarks(self, value: List[List[float]]) -> None:
+
         with self._lock: self._landmarks = value
 
     def snapshot(self) -> dict:
+
         """Get all state in single atomic operation."""
+
         with self._lock:
+
             return {
+
                 'hand_detected': self._hand_detected,
+
                 'gesture': self._gesture,
+
                 'state': self._cursor_state,
+
                 'landmarks': list(self._landmarks),
+
                 'dwell_progress': self._dwell_progress,
+
                 'x': self._cursor_x,
+
                 'y': self._cursor_y,
+
+                'skel_anchor_x': self._skel_anchor_x,
+
+                'skel_anchor_y': self._skel_anchor_y,
+
                 'hand_size': self._hand_size,
+
                 'depth_z': self._depth_z,
-                'is_pointing': self._is_pointing,
+
+                'hand_pose_mode': self._hand_pose_mode,
+
+                'palm_normal': self._palm_normal,
+
             }
 
     def update(
+
         self,
+
         x: int,
+
         y: int,
+
         state: str,
+
         gesture: str,
+
         hand_detected: bool = False,
+
         dwell_progress: float = 0.0,
+
         landmarks: Optional[List[List[float]]] = None,
+
         hand_size: float = 1.0,
+
         depth_z: float = 1.0,
-        is_pointing: bool = False,
+
+        skel_anchor_x: Optional[float] = None,
+
+        skel_anchor_y: Optional[float] = None,
+
     ) -> None:
+
+        """Batch-write all gesture state under a single lock acquisition.
+
+        FIX: skel_anchor_x/y are now written here instead of as separate
+        property sets before update().  This eliminates 2 extra RLock
+        acquisitions per frame (~20 FPS × 2 = 40 lock ops/sec saved).
+        """
+
         with self._lock:
+
             self._cursor_x = x
+
             self._cursor_y = y
+
             self._cursor_state = state
+
             self._gesture = gesture
+
             self._hand_detected = hand_detected
+
             self._dwell_progress = dwell_progress
+
             self._landmarks = landmarks if landmarks is not None else []
+
             self._hand_size = hand_size
+
             self._depth_z = depth_z
-            self._is_pointing = is_pointing
 
     def to_json(self) -> str:
+
         with self._lock:
-            d = {
-                "x": self._cursor_x,
-                "y": self._cursor_y,
-                "state": self._cursor_state,
-                "gesture": self._gesture,
-                "hand_detected": self._hand_detected,
-                "dwell_progress": round(self._dwell_progress, 3),
-                "hand_size": self._hand_size,
-                "depth_z": self._depth_z,
-                "is_pointing": self._is_pointing,
-            }
-            if self._hand_detected and self._landmarks:
-                d["landmarks"] = list(self._landmarks)
-                
-        dm_snap = display_manager.get_snapshot()
-        d['active_x_min']  = dm_snap['active_x_min']
-        d['active_x_max']  = dm_snap['active_x_max']
-        d['active_y_min']  = dm_snap['active_y_min']
-        d['active_y_max']  = dm_snap['active_y_max']
-        d['screen_width']  = dm_snap['target_width']
-        d['screen_height'] = dm_snap['target_height']
-        d['scale_x']       = dm_snap['scale_x']
-        d['scale_y']       = dm_snap['scale_y']
-        d['camera_width']  = CAMERA_WIDTH
-        d['camera_height'] = CAMERA_HEIGHT
-        d['cam_aspect']    = round(CAMERA_WIDTH / CAMERA_HEIGHT, 4) if CAMERA_HEIGHT else 1.333
-        d['rotation']      = 0
-        d['display_w'] = dm_snap['target_width']
-        d['display_h'] = dm_snap['target_height']
-        
-        return json.dumps(d, separators=(",", ":"))
 
+            d = self.snapshot()
+
+            d['dwell_progress'] = round(d['dwell_progress'], 3)
+
+            # Broadcast the complete camera→screen mapping contract so that
+
+            # overlay.py (and any future renderer) never needs to recompute
+
+            # geometry itself.  The overlay consumes scale_x / scale_y directly;
+
+            # the active_* and screen_* fields are included for completeness
+
+            # (calibration UIs, debug viewers, alternate renderers, etc.).
+
+            dm_snap = display_manager.get_snapshot()
+
+            d['active_x_min']  = dm_snap['active_x_min']
+
+            d['active_x_max']  = dm_snap['active_x_max']
+
+            d['active_y_min']  = dm_snap['active_y_min']
+
+            d['active_y_max']  = dm_snap['active_y_max']
+
+            d['screen_width']  = dm_snap['target_width']
+
+            d['screen_height'] = dm_snap['target_height']
+
+            d['scale_x']       = dm_snap['scale_x']
+
+            d['scale_y']       = dm_snap['scale_y']
+
+            d['depth_z']       = self._depth_z
+
+            d['camera_width']  = CAMERA_WIDTH
+
+            d['camera_height'] = CAMERA_HEIGHT
+
+            d['cam_aspect']    = round(CAMERA_WIDTH / CAMERA_HEIGHT, 4) if CAMERA_HEIGHT else 1.333
+
+            # Legacy keys — kept so overlay.py has a safe fallback before the
+
+            # first scale_x/scale_y arrives (uses window size as approximation).
+
+            d['display_w'] = display_manager.target_width
+
+            d['display_h'] = display_manager.target_height
+
+            return json.dumps(d, separators=(",", ":"))
 
 # ===========================================================================
-# ── One Euro Filter ───────────────────────────────────────────────────────
+
+# ── Gesture Processor Helpers ─────────────────────────────────────────────
+
 # ===========================================================================
 
-class _OneEuroFilter:
+def compute_palm_normal_3d(world_lm_np: Optional[np.ndarray], handedness_str: str = "Right") -> tuple[tuple[float, float, float], str, bool]:
+
     """
-    Adaptive low-pass filter for smooth pointer / cursor input.
 
-    Slow or stationary input is heavily smoothed (removes jitter).
-    Fast input passes through with minimal added lag.
+    Computes 3D unit palm normal vector (Nx, Ny, Nz) using metric world landmarks.
 
-    Parameters
-    ----------
-    freq        Nominal input sample rate in Hz (e.g. TARGET_FPS).
-    min_cutoff  Minimum cutoff frequency (Hz).  Lower → smoother at rest.
-    beta        Speed coefficient.  Higher → quicker response to fast motion.
-    d_cutoff    Cutoff for the derivative estimate (usually 1.0 Hz).
+    Inverts cross product for Left hands so palm-down is consistently -Ny.
 
-    Reference: Géry Casiez et al., "1€ Filter: A Simple Speed-based Low-pass
-               Filter for Noisy Input in Interactive Systems", CHI 2012.
+    Classifies posture mode:
+
+      - FLAT_PALM_DOWN: Ny < -0.50 (palm facing floor / back of hand facing camera)
+
+      - FLAT_PALM_UP:   Ny >  0.50 (palm facing ceiling)
+
+      - SIDEWAYS_EDGE:  |Nx| > 0.70 (hand turned sideways)
+
+      - PALM_FACING_CAMERA: default front-facing pose
+
+    Returns ((Nx, Ny, Nz), pose_mode_str, is_flat_down_mode_bool)
+
     """
 
-    def __init__(
-        self,
-        freq:       float,
-        min_cutoff: float = 1.0,
-        beta:       float = 0.007,
-        d_cutoff:   float = 1.0,
-    ) -> None:
-        self._freq       = freq
-        self._min_cutoff = min_cutoff
-        self._beta       = beta
-        self._d_cutoff   = d_cutoff
-        self._x:  Optional[float] = None   # last filtered value
-        self._dx: float           = 0.0    # last filtered derivative
+    if world_lm_np is None or len(world_lm_np) < 18:
 
-    @staticmethod
-    def _alpha(cutoff: float, freq: float) -> float:
-        """First-order low-pass coefficient for the given cutoff frequency."""
-        tau = 1.0 / (2.0 * math.pi * cutoff)
-        te  = 1.0 / freq
-        return 1.0 / (1.0 + tau / te)
+        return (0.0, 0.0, 1.0), "PALM_FACING_CAMERA", False
 
-    def filter(self, x: float, dt: Optional[float] = None) -> float:
+    v_index = world_lm_np[5, :3] - world_lm_np[0, :3]
+
+    v_pinky = world_lm_np[17, :3] - world_lm_np[0, :3]
+
+    if "Left" in handedness_str:
+
+        raw_normal = np.cross(v_pinky, v_index)
+
+    else:
+
+        raw_normal = np.cross(v_index, v_pinky)
+
+    norm = np.linalg.norm(raw_normal)
+
+    if norm < 1e-6:
+
+        return (0.0, 0.0, 1.0), "PALM_FACING_CAMERA", False
+
+    n = raw_normal / norm
+
+    nx, ny, nz = float(n[0]), float(n[1]), float(n[2])
+
+    is_flat_down = ny < -0.50 or abs(ny) > 0.65
+
+    if ny < -0.50:
+
+        mode = "FLAT_PALM_DOWN"
+
+    elif ny > 0.50:
+
+        mode = "FLAT_PALM_UP"
+
+    elif abs(nx) > 0.70:
+
+        mode = "SIDEWAYS_EDGE"
+
+    else:
+
+        mode = "PALM_FACING_CAMERA"
+
+    return (nx, ny, nz), mode, is_flat_down
+
+def check_finger_curl(lm_np: np.ndarray, world_lm_np: Optional[np.ndarray] = None, is_flat_mode: bool = False) -> tuple[float, float]:
+
+    """
+
+    Calculates pointing pose confidence score p in [0.0, 1.0] and index_score.
+
+    Evaluates 2D joint angles, with automatic 3D World Landmark fallback when
+
+    2D segments are compressed (< 0.035) or when in FLAT_PALM_DOWN mode.
+
+    Immune to camera Z-axis foreshortening.
+
+    Returns (pointing_score, index_score)
+
+    """
+
+    def cosine_angle(mcp_idx: int, pip_idx: int, tip_idx: int) -> float:
+
+        v1_2d = lm_np[pip_idx, :2] - lm_np[mcp_idx, :2]
+
+        v2_2d = lm_np[tip_idx, :2] - lm_np[pip_idx, :2]
+
+        n1_2d, n2_2d = np.linalg.norm(v1_2d), np.linalg.norm(v2_2d)
+
+        # Edge-on compression fallback to 3D World Space
+
+        if (n1_2d < 0.035 or n2_2d < 0.035 or is_flat_mode) and world_lm_np is not None:
+
+            v1_3d = world_lm_np[pip_idx, :3] - world_lm_np[mcp_idx, :3]
+
+            v2_3d = world_lm_np[tip_idx, :3] - world_lm_np[pip_idx, :3]
+
+            n1_3d, n2_3d = np.linalg.norm(v1_3d), np.linalg.norm(v2_3d)
+
+            if n1_3d < 1e-6 or n2_3d < 1e-6:
+
+                return 1.0
+
+            return float(np.clip(np.dot(v1_3d, v2_3d) / (n1_3d * n2_3d), -1.0, 1.0))
+
+        if n1_2d < 1e-6 or n2_2d < 1e-6:
+
+            return 1.0
+
+        cos_val = np.dot(v1_2d, v2_2d) / (n1_2d * n2_2d)
+
+        return float(np.clip(cos_val, -1.0, 1.0))
+
+    def clamp(val: float, lo: float = 0.0, hi: float = 1.0) -> float:
+
+        return max(lo, min(hi, val))
+
+    index_cos  = cosine_angle(5,  6,  8)
+
+    middle_cos = cosine_angle(9,  10, 12)
+
+    ring_cos   = cosine_angle(13, 14, 16)
+
+    pinky_cos  = cosine_angle(17, 18, 20)
+
+    # Index finger score: 0.65 -> 0.85 maps to 0.0 -> 1.0 (natural pointing angle)
+    index_score = clamp((index_cos - 0.65) / (0.85 - 0.65))
+
+    # Other fingers score: max cos 0.80 -> 0.65 maps to 0.0 -> 1.0 (relaxed curled fingers)
+    max_other_cos = max(middle_cos, ring_cos, pinky_cos)
+    other_curl_score = clamp((0.80 - max_other_cos) / (0.80 - 0.65))
+
+    # Pointing active is primarily driven by index extension so pointing activates with open, relaxed, or closed non-index fingers
+    pointing_score = index_score
+
+    return pointing_score, index_score
+
+class GestureFSM:
+
+    def __init__(self):
+
+        self.state = "MOVE"
+
+        self.dwell_start_ts = 0.0
+
+        self.cooldown_until = 0.0
+
+        self.dwell_origin = None
+
+    def tick(self, now: float, is_pointing: bool, screen_x: float, screen_y: float, dwell_radius: float) -> tuple[str, float]:
+
         """
-        Filter a new sample.
 
-        Parameters
-        ----------
-        x   Raw (noisy) sample.
-        dt  Seconds since the last sample.  None → use constructor freq.
+        Returns (cursor_state, dwell_progress)
+
         """
-        freq = (1.0 / dt) if (dt and dt > 0) else self._freq
 
-        if self._x is None:          # bootstrap
-            self._x = x
-            return x
+        if now < self.cooldown_until:
 
-        # Filtered derivative
-        dx_raw   = (x - self._x) * freq
-        alpha_d  = self._alpha(self._d_cutoff, freq)
-        self._dx = self._dx + alpha_d * (dx_raw - self._dx)
+            self.state = "MOVE"
 
-        # Adaptive cutoff: faster motion → higher cutoff → less lag
-        cutoff = self._min_cutoff + self._beta * abs(self._dx)
+            self.dwell_origin = None
 
-        # Filtered signal
-        alpha   = self._alpha(cutoff, freq)
-        self._x = self._x + alpha * (x - self._x)
-        return self._x
+            return "MOVE", 0.0
 
-    def reset(self) -> None:
-        """Reset to uninitialised state (call when tracking is lost)."""
-        self._x  = None
-        self._dx = 0.0
+        if not is_pointing:
 
+            self.state = "MOVE"
 
-# ===========================================================================
-# ── Gesture Processor ─────────────────────────────────────────────────────
-# ===========================================================================
+            self.dwell_origin = None
+
+            return "MOVE", 0.0
+
+        # Pointing is active
+
+        if self.dwell_origin is None:
+
+            self.dwell_origin = (screen_x, screen_y)
+
+            self.dwell_start_ts = now
+
+            self.state = "DWELL"
+
+            return "DWELL", 0.0
+
+        drift = math.hypot(screen_x - self.dwell_origin[0], screen_y - self.dwell_origin[1])
+
+        if drift > dwell_radius:
+
+            self.dwell_origin = (screen_x, screen_y)
+
+            self.dwell_start_ts = now
+
+            self.state = "DWELL"
+
+            return "DWELL", 0.0
+
+        elapsed = now - self.dwell_start_ts
+
+        progress = min(1.0, elapsed / DWELL_DURATION_S)
+
+        if progress >= 1.0:
+
+            self.state = "CLICK"
+
+            self.cooldown_until = now + 0.8
+
+            self.dwell_origin = None
+
+            return "CLICK", 1.0
+
+        self.state = "DWELL"
+
+        return "DWELL", progress
 
 class GestureProcessor:
-    """Stateful per-frame gesture interpreter."""
-    
-    def __init__(self, state: GestureState) -> None:
-        self._state = state
-        self._last_ts = 0.0
-        
-        # Adaptive cursor smoothing
-        self._filter_x = _OneEuroFilter(TARGET_FPS)
-        self._filter_y = _OneEuroFilter(TARGET_FPS)
-        
-        self._prev_screen_x: Optional[int] = None
-        self._prev_screen_y: Optional[int] = None
 
-        self._lm_filters = None  # populated on first frame
+    """
 
-        # ── Fix A: Pre-allocated numpy buffers ────────────────────────────────
-        # Avoids ~120 heap allocations/second from np.array() and np.zeros_like()
-        # in the per-frame hot path.
-        self._raw_lm_buf      = np.zeros((21, 2), dtype=np.float32)
-        self._filtered_lm_buf = np.zeros((21, 2), dtype=np.float32)
+    Stateful per-frame gesture interpreter.
 
-        # Depth size metric filter
-        self._size_filter = depth_metrics.EMAFilter(alpha=SIZE_EMA_ALPHA)
+    Accepts landmarks from the Tasks API.
 
-        # Dwell-to-click state
-        self._dwell_origin_x: Optional[int] = None
-        self._dwell_origin_y: Optional[int] = None
-        self._dwell_start_ts: float         = 0.0
-        self._dwell_cooldown_until: float   = 0.0
+    Click mechanism: dwell-to-click.
+
+    A CLICK fires when the cursor stays within DWELL_RADIUS_PX pixels of its
+
+    starting position for DWELL_DURATION_S seconds. After firing, a cooldown
+
+    prevents accidental repeat clicks.
+
+    """
+
+    def __init__(self, shared_state: GestureState) -> None:
+
+        self._state = shared_state
+
+        self._last_ts: float = 0.0   # timestamp of most-recent detected frame
+
+        self._fsm = GestureFSM()
+
+        self._cursor_filter = OneEuroFilter(min_cutoff=2.5, beta=3.5, d_cutoff=1.0)
+
+        # Velocity extrapolation & Adaptive EMA landmark smoothing state
+
+        self._last_raw_lm:  Optional[np.ndarray] = None
+
+        self._lm_velocity:  Optional[np.ndarray] = None
+
+        self._lm_ema:       Optional[np.ndarray] = None
+
+        self._pointing_active: bool              = False
 
         # Swipe detection
-        self._x_history: deque[float] = deque(maxlen=SWIPE_HISTORY_LEN)
-        self._swipe_cooldown: int     = 0
 
-        self._mouse = async_mouse
+        self._x_history: deque[tuple[float, float]] = deque()
+
+        self._swipe_cooldown_until: float = 0.0
+
+        # OS mouse controller (pynput) — None when pynput is unavailable or disabled
+
+        self._mouse = (
+
+            _MouseController()
+
+            if (_PYNPUT_AVAILABLE and ENABLE_SYSTEM_MOUSE)
+
+            else None
+
+        )
+
         self._prev_cursor_state: str = "MOVE"
+
+        # Micro-tremor deadzone state (Fix 6)
+
+        self._last_screen_x: Optional[int] = None
+
+        self._last_screen_y: Optional[int] = None
+
+        # FIX: Pre-allocated buffers — avoid per-frame np.array() / np.full()
+        # allocations that caused GC pressure during fast hand movement.
+        self._raw_buf    = np.zeros((21, 3), dtype=np.float32)
+        self._world_buf  = np.zeros((21, 3), dtype=np.float32)
+        self._alpha_buf  = np.full((21, 1), 0.5, dtype=np.float32)
+        self._last_raw_lm_buf = np.zeros((21, 3), dtype=np.float32)
+        self._has_last_raw = False
+
         
-        # 5. Auto-Calibration for REFERENCE_SIZE
-        self._ref_size: float = REFERENCE_SIZE
-        self._calibrating: bool = True
-        self._calibration_start_ts: float = 0.0
-        self._calibration_samples: List[float] = []
-        
-        # Dedicated depth_z smoother — separate from the size metric EMA
-        # used for bounds calculation. This one is specifically for the
-        # skeleton scale factor sent to the overlay.
-        self._depth_z_ema = _SimpleEMA(alpha=0.08)  # very smooth skeleton scaling
 
-        # ── Pointing-Mode State Machine ───────────────────────────────────────
-        self.is_pointing: bool = False
-        self._point_enter_ctr: int = 0
-        self._point_exit_ctr:  int = 0
-        self._point_blend: float = 0.0
+        # evdev for linux native clicks
 
-        # Separate slow EMA for OEF parameter tuning only.
-        self._oef_depth_ema = _SimpleEMA(alpha=0.03)
+        self._ui = None
 
-        # ── Fix C: Cached OEF blend state ─────────────────────────────────────
-        # Skip re-applying filter params when neither _point_blend nor depth has
-        # changed meaningfully, saving 6 float assignments per stable frame.
-        self._last_oef_depth_z: float   = -1.0
-        self._last_point_blend: float   = -1.0
-        self._cached_lm_min_cutoff: float = OEF_MIN_CUTOFF
-        self._cached_lm_beta: float       = OEF_BETA
+        if sys.platform != "win32":
 
-    @staticmethod
-    def _is_pointing_raw(raw_lm_np: np.ndarray) -> bool:
+            try:
+
+                import evdev
+
+                from evdev import UInput, ecodes as e
+
+                self._ui = UInput({e.EV_KEY: [e.BTN_LEFT]}, name="GestureEngine_Mouse")
+
+                log.info("Initialized evdev UInput for native clicks.")
+
+            except Exception as ex:
+
+                log.warning(f"Could not init evdev UInput: {ex}. Falling back to xdotool if needed.")
+
+        self._is_pointing: bool = False
+
+    def process(self, lms: Any, world_lms: Optional[Any] = None) -> None:
+
         """
-        Rotation-invariant pointing detection using joint-distance ratios.
 
-        Y-only comparisons (tip.y < pip.y) break when the hand is tilted
-        sideways or downward relative to the camera. Instead, we compare the
-        distance each fingertip is from the wrist vs. its MCP knuckle's distance
-        from the wrist — a ratio that is stable under any in-plane rotation.
-
-        A finger is EXTENDED when its tip is farther from the wrist than its
-        MCP knuckle (ratio > 1.0 with a tolerance margin).
-        A finger is CURLED  when its tip is closer to the wrist than its MCP.
-
-        MediaPipe landmark indices:
-          Wrist: 0
-          Index:  MCP=5,  PIP=6,  DIP=7,  Tip=8
-          Middle: MCP=9,  PIP=10, DIP=11, Tip=12
-          Ring:   MCP=13, PIP=14, DIP=15, Tip=16
-          Pinky:  MCP=17, PIP=18, DIP=19, Tip=20
-        """
-        wrist = raw_lm_np[0]
-
-        def tip_mcp_ratio(tip_idx: int, mcp_idx: int) -> float:
-            """tip-to-wrist distance / mcp-to-wrist distance."""
-            d_tip = float(np.linalg.norm(raw_lm_np[tip_idx] - wrist))
-            d_mcp = float(np.linalg.norm(raw_lm_np[mcp_idx] - wrist))
-            return d_tip / max(d_mcp, 1e-6)
-
-        # Index extended: tip farther from wrist than MCP (ratio > 1.15 headroom)
-        index_ext   = tip_mcp_ratio(8,  5) > 1.15
-
-        # Other fingers curled: tip closer to wrist than MCP (ratio < 0.95)
-        middle_curl = tip_mcp_ratio(12, 9)  < 0.95
-        ring_curl   = tip_mcp_ratio(16, 13) < 0.95
-        pinky_curl  = tip_mcp_ratio(20, 17) < 0.95
-        curled_count = sum([middle_curl, ring_curl, pinky_curl])
-
-        # Require index extended AND at least 2 other fingers curled
-        return index_ext and curled_count >= 2
-
-    def process(self, lms) -> None:
-        """
         lms — iterable of 21 landmark objects with .x / .y (normalised 0-1).
-              Works with both NormalizedLandmarkList.landmark (legacy)
-              and list[NormalizedLandmark] (Tasks API).
+
+        world_lms — iterable of 21 landmark objects with .x / .y / .z (meters, wrist-origin).
+
         """
+
         now = time.perf_counter()
 
         # ── 1. Extract and Rotate Landmarks ─────────────────────────────────
-        # Fix A: Fill the pre-allocated buffer in-place rather than allocating
-        # a new array every frame (avoids ~60 numpy allocs/sec).
-        raw_lm_np = self._raw_lm_buf
-        for _i, _lm in enumerate(lms):
-            raw_lm_np[_i, 0] = _lm.x
-            raw_lm_np[_i, 1] = _lm.y
 
-        # Camera axes align with the physical world — no rotation needed.
-        # raw_lm_np is already in the correct frame.
+        # FIX: Fill pre-allocated buffers instead of creating new arrays per frame.
+        raw_lm_np = self._raw_buf
+        for i, lm in enumerate(lms):
+            raw_lm_np[i, 0] = lm.x
+            raw_lm_np[i, 1] = lm.y
+            raw_lm_np[i, 2] = getattr(lm, 'z', 0.0)
 
-        # ── Pointing-Mode Detection + Hysteresis ─────────────────────────────
-        # Classify each frame independently, then require N consecutive frames
-        # before committing to a mode change. Prevents threshold-edge flickering
-        # from simultaneously flipping the anchor blend, OEF params, and the
-        # optical-flow landmark mask used by the camera loop.
-        is_raw = self._is_pointing_raw(raw_lm_np)
-        if is_raw:
-            self._point_enter_ctr += 1
-            self._point_exit_ctr   = 0
+        world_lm_np = None
+
+        if world_lms:
+
+            world_lm_np = self._world_buf
+            for i, lm in enumerate(world_lms):
+                world_lm_np[i, 0] = lm.x
+                world_lm_np[i, 1] = lm.y
+                world_lm_np[i, 2] = getattr(lm, 'z', 0.0)
+
+        _rotation = display_manager.rotation
+
+        if _rotation == 90:
+
+            raw_lm_np[:, :2] = 1.0 - raw_lm_np[:, [1, 0]]
+
+        elif _rotation == -90:
+
+            raw_lm_np[:, :2] = raw_lm_np[:, [1, 0]]
+
+        elif _rotation == 180:
+
+            raw_lm_np[:, 1] = 1.0 - raw_lm_np[:, 1]
+
+            
+
+        self._run_pipeline(now, raw_lm_np, world_lm_np)
+
+        
+
+    def miss(self) -> None:
+
+        now = time.perf_counter()
+
+        # Use velocity extrapolation for up to MISS_TOLERANCE_S before resetting
+
+        if self._last_raw_lm is not None and (now - self._last_ts) < MISS_TOLERANCE_S:
+
+            self._run_pipeline(now, None, None)
+
         else:
-            self._point_exit_ctr  += 1
-            self._point_enter_ctr  = 0
 
-        if not self.is_pointing and self._point_enter_ctr >= POINTING_ENTER_FRAMES:
-            self.is_pointing = True
-            log.debug("Pointing mode: ENTER")
-        elif self.is_pointing and self._point_exit_ctr >= POINTING_EXIT_FRAMES:
-            self.is_pointing = False
-            log.debug("Pointing mode: EXIT")
+            self.reset()
 
-        # Advance blend scalar toward target (0=normal, 1=pointing) by 1/BLEND_FRAMES
-        # per frame — smoothly interpolates anchor alpha and OEF params across
-        # every mode transition instead of hard-switching them.
-        blend_target = 1.0 if self.is_pointing else 0.0
-        blend_step   = 1.0 / max(1, POINTING_BLEND_FRAMES)
-        if self._point_blend < blend_target:
-            self._point_blend = min(blend_target, self._point_blend + blend_step)
-        elif self._point_blend > blend_target:
-            self._point_blend = max(blend_target, self._point_blend - blend_step)
+            
 
-        # ── Cursor Anchor ───────────────────────────────────────────────────
-        # In pointing mode, blend LM 8 (tip) toward LM 5 (index MCP knuckle).
-        # Targets joint-angle jitter specifically — where LM 8 moves relative
-        # to LM 5 due to micro-oscillations. Whole-hand translation (both
-        # points moving together) is unaffected and passes through at full gain.
-        # INTENTIONAL TRADE-OFF: reduces ~12% of fine fingertip aiming precision
-        # in exchange for eliminating the dominant jitter source at rest.
-        # The overlay skeleton still renders at true LM 8 (cursor != skeleton).
-        eff_alpha = POINTING_ANCHOR_ALPHA * self._point_blend + 1.0 * (1.0 - self._point_blend)
-        raw_x = float(eff_alpha * raw_lm_np[8, 0] + (1.0 - eff_alpha) * raw_lm_np[5, 0])
-        raw_y = float(eff_alpha * raw_lm_np[8, 1] + (1.0 - eff_alpha) * raw_lm_np[5, 1])
+    def _run_pipeline(self, now: float, raw_lm_np: Optional[np.ndarray], world_lm_np: Optional[np.ndarray]) -> None:
 
+        # ── Landmark resolution & Gross Palm Velocity-Scaled Adaptive EMA ──
+
+        if raw_lm_np is not None:
+
+            # 3D Palm Normal & Posture Mode Classification
+
+            palm_normal, hand_pose_mode, is_flat_down = compute_palm_normal_3d(world_lm_np)
+
+            self._hand_pose_mode = hand_pose_mode
+
+            self._palm_normal = palm_normal
+
+            self._state.hand_pose_mode = hand_pose_mode
+
+            self._state.palm_normal = palm_normal
+
+            if self._last_ts > 0 and self._last_raw_lm is not None:
+
+                dt = now - self._last_ts
+
+                if dt > 0:
+
+                    self._lm_velocity = (raw_lm_np - self._last_raw_lm) / dt
+
+                    # Gross Palm Center velocity (Wrist 0, Index Base 5, Pinky Base 17) to prevent single-joint noise spikes
+
+                    palm_vel = np.mean(self._lm_velocity[[0, 5, 17], :2], axis=0)
+
+                    palm_speed = float(np.linalg.norm(palm_vel))
+
+                    alpha_val = float(np.clip(0.15 + (0.95 - 0.15) * (1.0 - np.exp(-3.0 * palm_speed)), 0.15, 0.95))
+
+                    # FIX: Reuse pre-allocated buffer instead of np.full() per frame
+                    self._alpha_buf[:] = alpha_val
+                    alphas = self._alpha_buf
+
+                else:
+
+                    alphas = 0.5
+
+            else:
+
+                # FIX: Reuse pre-allocated buffer instead of np.zeros_like() per frame
+                self._lm_velocity = np.zeros_like(raw_lm_np)
+                alphas = 1.0
+
+            if self._lm_ema is None or self._lm_ema.shape != raw_lm_np.shape:
+
+                self._lm_ema = raw_lm_np.copy()
+
+            else:
+
+                self._lm_ema = alphas * raw_lm_np + (1.0 - alphas) * self._lm_ema
+
+            # FIX: Copy into pre-allocated buffer instead of allocating a new array
+            np.copyto(self._last_raw_lm_buf, raw_lm_np)
+            self._last_raw_lm = self._last_raw_lm_buf
+            self._has_last_raw = True
+
+            self._last_ts = now
+
+            # Pointing score & Index Extension Primacy Hysteresis Schmitt Trigger
+            pointing_score, index_score = check_finger_curl(raw_lm_np, world_lm_np, is_flat_down)
+
+            if index_score >= 0.50:
+                self._pointing_active = True
+            elif index_score <= 0.35:
+                self._pointing_active = False
+
+            smooth_lm_np = self._lm_ema
+
+        else:
+
+            # Missed frame: linearly extrapolate up to MISS_TOLERANCE_S
+
+            if self._last_raw_lm is None or self._lm_velocity is None or self._lm_ema is None:
+
+                self.reset()
+
+                return
+
+            dt_miss = now - self._last_ts
+
+            smooth_lm_np = self._last_raw_lm + self._lm_velocity * dt_miss
+
+            pointing_score = 1.0 if self._pointing_active else 0.0
 
         def clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
+
             return max(lo, min(hi, v))
-        s_raw = depth_metrics.get_rigid_palm_metric(raw_lm_np)
-        s = max(self._size_filter.filter(s_raw), 0.001)
-        
-        if self._calibrating:
-            if self._calibration_start_ts == 0.0:
-                self._calibration_start_ts = now
-                log.info("Starting hand depth calibration...")
+
             
-            self._calibration_samples.append(s)
+
+        # ── Anchor projection & Weighted Dual-Vector Ray Blend ─────────────────
+
+        tip_x = float(smooth_lm_np[8, 0])
+
+        tip_y = float(smooth_lm_np[8, 1])
+
+        # Screen anchor for skeleton rendering (so it doesn't rubber-band)
+
+        skel_anchor_x = tip_x
+
+        skel_anchor_y = tip_y
+
+        if pointing_score > 0.05:
+
+            # Weighted Dual-Vector ray calculation: 60% Wrist->Base (0->5), 40% Base->Tip (5->8)
+
+            v_05 = smooth_lm_np[5, :2] - smooth_lm_np[0, :2]
+
+            v_58 = smooth_lm_np[8, :2] - smooth_lm_np[5, :2]
+
+            n_58 = float(np.linalg.norm(v_58))
+
+            if is_flat_down or n_58 < 0.035:
+
+                dx, dy = float(v_05[0]), float(v_05[1])
+
+            else:
+
+                v_blend = 0.6 * v_05 + 0.4 * v_58
+
+                dx, dy = float(v_blend[0]), float(v_blend[1])
+
+            if world_lm_np is not None:
+
+                depth_span_3d = float(np.linalg.norm(world_lm_np[9, :3] - world_lm_np[0, :3]))
+
+                ray_length_multiplier = 1.6 * max(0.6, min(2.5, REFERENCE_3D_SPAN / max(depth_span_3d, 0.01)))
+
+            else:
+
+                ray_length_multiplier = 1.6
+
+            projected_x = smooth_lm_np[0, 0] + dx * ray_length_multiplier
+
+            projected_y = smooth_lm_np[0, 1] + dy * ray_length_multiplier
+
             
-            if now - self._calibration_start_ts > 1.5:  # 1.5s calibration window
-                self._ref_size = sum(self._calibration_samples) / len(self._calibration_samples)
-                self._calibrating = False
-                log.info(f"Calibration complete. New REFERENCE_SIZE: {self._ref_size:.4f}")
-            
-            # During calibration, lock the cursor by not emitting mouse events
-            # But we still update the filters so it doesn't jump wildly after calibration
-            # We'll just exit early after updating EMAs.
-        
-        # Compute the depth ratio for skeleton scaling in overlay
-        raw_depth_z = s / max(0.001, self._ref_size)
-        # Clamp to a sane visual range, then smooth heavily to prevent
-        # the skeleton from jittering/reshaping on every frame
-        depth_z = max(0.5, min(2.0, self._depth_z_ema.update(raw_depth_z)))
-        
-        # ── Depth-adaptive One Euro Filter tuning ─────────────────────────
-        # OEF params are driven by a SEPARATE slow EMA (alpha=0.03, ~33-frame
-        # time constant) rather than directly from depth_z. This decouples the
-        # filter's own parameters from fast depth fluctuations — the root cause
-        # of the "rubber band" effect where min_cutoff and beta oscillate each
-        # frame, making the filter itself a noise source.
-        oef_depth_z  = max(0.5, min(2.0, self._oef_depth_ema.update(raw_depth_z)))
-        depth_factor = max(1.0, math.sqrt(oef_depth_z))
 
-        # Blend OEF params between default and pointing-specific using _point_blend.
-        target_min_cutoff = (POINTING_OEF_MIN_CUTOFF * self._point_blend
-                             + OEF_MIN_CUTOFF         * (1.0 - self._point_blend))
-        target_beta       = (POINTING_OEF_BETA * self._point_blend
-                             + OEF_BETA        * (1.0 - self._point_blend))
+            # Continuous projection blend based on pointing score
 
-        # Fix C: Only re-apply filter params when depth or blend has changed
-        # meaningfully. Skips 6 float assignments on stable frames.
-        _depth_changed = abs(oef_depth_z - self._last_oef_depth_z) > 0.01
-        _blend_changed = abs(self._point_blend - self._last_point_blend) > 0.005
-        if _depth_changed or _blend_changed:
-            self._filter_x._min_cutoff = target_min_cutoff * depth_factor
-            self._filter_y._min_cutoff = target_min_cutoff * depth_factor
-            self._filter_x._beta       = target_beta / depth_factor
-            self._filter_y._beta       = target_beta / depth_factor
-            self._cached_lm_min_cutoff = target_min_cutoff * depth_factor
-            self._cached_lm_beta       = target_beta / depth_factor
-            self._last_oef_depth_z     = oef_depth_z
-            self._last_point_blend     = self._point_blend
+            p = pointing_score
 
+            raw_x = (1.0 - p) * tip_x + p * float(projected_x)
 
-        # ── 2. One Euro Filter — adaptive smooth cursor ─────────────────────
-        dt      = (now - self._last_ts) if self._last_ts > 0 else None
-        self._last_ts = now
-        smooth_x = self._filter_x.filter(raw_x, dt)
-        smooth_y = self._filter_y.filter(raw_y, dt)
-        
-        if self._calibrating:
-            # Feed the display manager EMAs even while calibrating to pre-warm the center
-            display_manager.get_depth_adjusted_bounds(s, REFERENCE_SIZE)
-            return
+            raw_y = (1.0 - p) * tip_y + p * float(projected_y)
 
-        # ── 3. Normalised → screen pixels (mirror X for natural movement) ─
-        # Get dynamic tracking bounds based on current depth
-        dm_snap = display_manager.get_depth_adjusted_bounds(s, self._ref_size)
-        active_x_min = dm_snap['active_x_min']
-        active_x_max = dm_snap['active_x_max']
-        active_y_min = dm_snap['active_y_min']
-        active_y_max = dm_snap['active_y_max']
-        target_width = dm_snap['target_width']
-        target_height = dm_snap['target_height']
-
-        mapped_x = clamp((smooth_x - active_x_min) / (active_x_max - active_x_min)) if (active_x_max - active_x_min) != 0 else 0.5
-        mapped_y = clamp((smooth_y - active_y_min) / (active_y_max - active_y_min)) if (active_y_max - active_y_min) != 0 else 0.5
-
-        def apply_edge_acceleration(val: float, power: float = 1.0) -> float:
-            nx = (val - 0.5) * 2.0
-            nx = math.copysign(abs(nx) ** power, nx)
-            return (nx / 2.0) + 0.5
-
-        mapped_x = apply_edge_acceleration(mapped_x)
-        mapped_y = apply_edge_acceleration(mapped_y)
-
-        screen_x = max(0, min(target_width  - 1, int((1.0 - mapped_x) * target_width)))
-        screen_y = max(0, min(target_height - 1, int(mapped_y * target_height)))
-
-        # ── Cursor Dead-Zone (Stabilization) ──────────────────────────────
-        if self._prev_screen_x is not None and self._prev_screen_y is not None:
-            dist = math.hypot(screen_x - self._prev_screen_x, screen_y - self._prev_screen_y)
-            DEAD_ZONE_PX = 4.0   # ignore sub-pixel drift while "aiming"
-            if dist < DEAD_ZONE_PX:
-                screen_x = self._prev_screen_x
-                screen_y = self._prev_screen_y
-
-        self._prev_screen_x = screen_x
-        self._prev_screen_y = screen_y
-
-        # ── 4. Dwell-to-click detection ───────────────────────────────────
-        in_cooldown = now < self._dwell_cooldown_until
-
-        if in_cooldown:
-            # Suppress input during cooldown; keep progress at 0
-            dwell_progress = 0.0
-            cursor_state   = "MOVE"
-            # Reset dwell origin so dwell restarts fresh after cooldown
-            self._dwell_origin_x = screen_x
-            self._dwell_origin_y = screen_y
-            self._dwell_start_ts = now
         else:
-            # Initialise origin on first frame after appearance / cooldown end
-            if self._dwell_origin_x is None:
-                self._dwell_origin_x = screen_x
-                self._dwell_origin_y = screen_y
-                self._dwell_start_ts = now
+            raw_x = tip_x
+            raw_y = tip_y
+
+        def clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
+
+            return max(lo, min(hi, v))
+
+            
+
+        # ── Anchor projection ────────────────────────────────────────────────
+
+        tip_x = float(smooth_lm_np[8, 0])
+
+        tip_y = float(smooth_lm_np[8, 1])
+
+        # Screen anchor for skeleton rendering (so it doesn't rubber-band)
+
+        skel_anchor_x = tip_x
+
+        skel_anchor_y = tip_y
+
+        if pointing_score > 0.05:
+
+            # Ray from Wrist (0) to Index Base (5)
+
+            dx = smooth_lm_np[5, 0] - smooth_lm_np[0, 0]
+
+            dy = smooth_lm_np[5, 1] - smooth_lm_np[0, 1]
+
+            if world_lm_np is not None:
+
+                depth_span_3d = float(np.linalg.norm(world_lm_np[9, :3] - world_lm_np[0, :3]))
+
+                ray_length_multiplier = 1.6 * max(0.6, min(2.5, REFERENCE_3D_SPAN / max(depth_span_3d, 0.01)))
+
             else:
-                # Check whether hand has drifted out of the dwell zone
-                drift = math.hypot(
-                    screen_x - self._dwell_origin_x,
-                    screen_y - self._dwell_origin_y,
-                )
-                edge_factor = max(abs(mapped_x - 0.5), abs(mapped_y - 0.5)) * 2.0
-                dynamic_radius = DWELL_RADIUS_PX + (DWELL_RADIUS_PX * 1.5 * edge_factor)
-                
-                if drift > dynamic_radius:
-                    # Moved too much — restart the timer at the new position
-                    self._dwell_origin_x = screen_x
-                    self._dwell_origin_y = screen_y
-                    self._dwell_start_ts = now
 
-            elapsed        = now - self._dwell_start_ts
-            dwell_progress = min(1.0, elapsed / DWELL_DURATION_S)
+                ray_length_multiplier = 1.6
 
-            if dwell_progress >= 1.0:
-                cursor_state             = "CLICK"
-                self._dwell_cooldown_until = now + DWELL_COOLDOWN_S
-                # Reset origin — next dwell starts from scratch after cooldown
-                self._dwell_origin_x = None
-                log.info("Dwell click fired at (%d, %d)", screen_x, screen_y)
+            projected_x = smooth_lm_np[0, 0] + dx * ray_length_multiplier
+
+            projected_y = smooth_lm_np[0, 1] + dy * ray_length_multiplier
+
+            
+
+            # Continuous projection blend based on pointing score
+
+            p = pointing_score
+
+            raw_x = (1.0 - p) * tip_x + p * float(projected_x)
+
+            raw_y = (1.0 - p) * tip_y + p * float(projected_y)
+
+        else:
+
+            raw_x = tip_x
+
+            raw_y = tip_y
+
+        
+
+        # Apply OneEuro Filter to Cursor X/Y
+
+        cursor_pos = self._cursor_filter(now, np.array([raw_x, raw_y]))
+
+        smooth_x, smooth_y = float(cursor_pos[0]), float(cursor_pos[1])
+
+        # Fix 2: Consume display bounds from DisplayManager (single source of truth)
+
+        dm = display_manager.get_snapshot()
+
+        active_x_min  = dm['active_x_min']
+
+        active_x_max  = dm['active_x_max']
+
+        active_y_min  = dm['active_y_min']
+
+        active_y_max  = dm['active_y_max']
+
+        target_width  = dm['target_width']
+
+        target_height = dm['target_height']
+
+        def map_to_screen(x, y):
+
+            mapped_x = clamp((x - active_x_min) / (active_x_max - active_x_min)) if (active_x_max - active_x_min) != 0 else 0.5
+
+            mapped_y = clamp((y - active_y_min) / (active_y_max - active_y_min)) if (active_y_max - active_y_min) != 0 else 0.5
+
+            def apply_edge_acceleration(val: float, power: float = 1.3) -> float:
+
+                nx = (val - 0.5) * 2.0
+
+                nx = math.copysign(abs(nx) ** power, nx)
+
+                return (nx / 2.0) + 0.5
+
+            mapped_x = apply_edge_acceleration(mapped_x)
+
+            mapped_y = apply_edge_acceleration(mapped_y)
+
+            sx = max(0, min(target_width  - 1, int((1.0 - mapped_x) * target_width)))
+
+            sy = max(0, min(target_height - 1, int(mapped_y * target_height)))
+
+            return sx, sy
+
+            
+
+        screen_x, screen_y = map_to_screen(smooth_x, smooth_y)
+
+        skel_sx, skel_sy   = map_to_screen(skel_anchor_x, skel_anchor_y)
+
+        # Fix 6: Micro-tremor velocity deadzone — freeze pixel coords when hovering
+
+        if self._last_screen_x is not None:
+
+            if math.hypot(screen_x - self._last_screen_x, screen_y - self._last_screen_y) < 2.0:
+
+                screen_x, screen_y = self._last_screen_x, self._last_screen_y
+
             else:
-                cursor_state = "MOVE"
 
-        # Swipe history uses the One-Euro-filtered value (same axis as cursor)
-        self._x_history.append(smooth_x)
-        gesture = "NONE"
+                self._last_screen_x, self._last_screen_y = screen_x, screen_y
 
-        if self._swipe_cooldown > 0:
-            self._swipe_cooldown -= 1
-        elif len(self._x_history) == SWIPE_HISTORY_LEN:
-            dx       = self._x_history[-1] - self._x_history[0]
-            velocity = dx / SWIPE_HISTORY_LEN
-            if abs(velocity) > SWIPE_VELOCITY_THRESHOLD:
-                gesture = "SWIPE_RIGHT" if velocity < 0 else "SWIPE_LEFT"
-                self._swipe_cooldown = SWIPE_COOLDOWN_FRAMES
-                self._dwell_origin_x = None
-                log.info("Gesture: %s  (vel=%.4f)", gesture, velocity)
+        else:
 
-        # ── 6. Per-landmark Uniform EMA Filter for smooth overlay dots ────────────────
-        if self._lm_filters is None:
-            self._lm_filters = []
-            for i in range(21):
-                self._lm_filters.append((
-                    _SimpleEMA(alpha=LM_EMA_ALPHA),
-                    _SimpleEMA(alpha=LM_EMA_ALPHA)
-                ))
+            self._last_screen_x, self._last_screen_y = screen_x, screen_y
 
-        filtered_lm_np = self._filtered_lm_buf
-        for i in range(21):
-            filtered_lm_np[i, 0] = self._lm_filters[i][0].update(float(raw_lm_np[i, 0]))
-            filtered_lm_np[i, 1] = self._lm_filters[i][1].update(float(raw_lm_np[i, 1]))
+        # ── 4. Dwell-to-click detection (gated by Hysteresis Schmitt Trigger) ─
 
-        # We purposely do NOT clamp the landmarks to [0.0, 1.0] here.
-        # Clamping at the edges causes the hand skeleton to compress against 
-        # the boundary and stretch like rubber when the hand moves partially off-screen.
+        # Use skeleton anchor (raw index tip) for dwell origin — it's far more
 
-        publish_lm = filtered_lm_np.tolist()
+        # stable than the OneEuro-filtered + ray-projected cursor coordinates.
 
-        # ── 7. Publish ────────────────────────────────────────────────────
-        self._state.update(
-            screen_x, screen_y, cursor_state, gesture,
-            hand_detected=True,
-            dwell_progress=dwell_progress,
-            landmarks=publish_lm,        # smoothed dots sent to overlay (true LM 8)
-            hand_size=s,                 # smoothed depth proxy
-            depth_z=depth_z,             # depth ratio
-            is_pointing=self.is_pointing, # persistent mode flag (separate from gesture enum)
+        cursor_state, dwell_progress = self._fsm.tick(
+
+            now, self._pointing_active, skel_sx, skel_sy, DWELL_RADIUS_PX
+
         )
 
-        # ── 8. OS mouse control (xdotool) ──────────────────────────────────
+        if cursor_state == "CLICK":
+
+            log.info("Dwell click fired at (%d, %d)", screen_x, screen_y)
+
+        # Swipe history uses the smoothed value (same axis as cursor)
+
+        self._x_history.append((now, smooth_x))
+
+        while self._x_history and now - self._x_history[0][0] > SWIPE_HISTORY_DURATION_S:
+
+            self._x_history.popleft()
+
+            
+
+        gesture = "NONE"
+
+        if now >= self._swipe_cooldown_until and len(self._x_history) >= 2:
+
+            dt_swipe = self._x_history[-1][0] - self._x_history[0][0]
+
+            if dt_swipe > 0.05:
+
+                dx       = self._x_history[-1][1] - self._x_history[0][1]
+
+                velocity = dx / dt_swipe
+
+                if abs(velocity) > SWIPE_VELOCITY_THRESHOLD:
+
+                    gesture = "SWIPE_RIGHT" if velocity < 0 else "SWIPE_LEFT"
+
+                    self._swipe_cooldown_until = now + SWIPE_COOLDOWN_S
+
+                    self._fsm.dwell_origin = None
+
+                    log.info("Gesture: %s  (vel=%.4f)", gesture, velocity)
+
+        publish_lm = smooth_lm_np.tolist()
+
+        # ── 7. Publish ────────────────────────────────────────────────────
+
+        # Update shared state with skel_anchor for drawing
+
+        self._state.skel_anchor_x = float(skel_sx)
+
+        self._state.skel_anchor_y = float(skel_sy)
+
+        self._state.update(
+
+            screen_x, screen_y, cursor_state, gesture,
+
+            hand_detected=True,
+
+            dwell_progress=dwell_progress,
+
+            landmarks=publish_lm,
+
+            hand_size=1.0,            # fixed size
+
+            depth_z=1.0,              # fixed size
+
+        )
+
+        # ── 8. OS mouse control ──────────────────────────────────
+
         if self._mouse is not None:
-            # Move the system cursor asynchronously so it never blocks the camera loop
-            self._mouse.set_position(screen_x, screen_y)
-            # Fire a single left-click only on the MOVE → CLICK transition
-            if cursor_state == "CLICK" and self._prev_cursor_state != "CLICK":
+
+            self._mouse.position = (screen_x, screen_y)
+
+            
+
+        if cursor_state == "CLICK" and self._prev_cursor_state != "CLICK":
+
+            if self._ui is not None:
+
+                # Evdev native click
+
+                try:
+
+                    import evdev
+
+                    self._ui.write(evdev.ecodes.EV_KEY, evdev.ecodes.BTN_LEFT, 1)
+
+                    self._ui.write(evdev.ecodes.EV_KEY, evdev.ecodes.BTN_LEFT, 0)
+
+                    self._ui.syn()
+
+                    log.info("Evdev click injected at (%d, %d)", screen_x, screen_y)
+
+                except Exception as e:
+
+                    log.error(f"Evdev click failed: {e}")
+
+            else:
+
+                # Fallback to xdotool
+
                 def _inject_click():
+
                     try:
-                        from pynput.mouse import Controller, Button
-                        mouse = Controller()
-                        mouse.click(Button.left, 1)
+
+                        if not hasattr(self, "_cached_screenflex_wins"):
+
+                            r = subprocess.run(["xdotool", "search", "--name", "Screenflex"],
+
+                                               capture_output=True, text=True, timeout=3)
+
+                            self._cached_screenflex_wins = [w for w in r.stdout.strip().split() if w.isdigit()]
+
+                        wins = self._cached_screenflex_wins
+
+                        if wins:
+
+                            for wid in wins:
+
+                                subprocess.run(["xdotool", "click", "--window", wid, "1"], capture_output=True, timeout=3)
+
+                        else:
+
+                            subprocess.run(["xdotool", "click", "1"], capture_output=True, timeout=3)
+
                         log.info("OS click injected at (%d, %d)", screen_x, screen_y)
-                    except ImportError:
-                        log.warning("pynput not installed. Click skipped.")
+
                     except Exception as e:
+
                         log.warning("Click injection failed: %s", e)
-                
-                # Run the click injection asynchronously so it doesn't freeze the camera loop
+
                 threading.Thread(target=_inject_click, daemon=True).start()
+
                 
+
         self._prev_cursor_state = cursor_state
 
     def reset(self) -> None:
-        """Called when no hand is detected — clears transient state."""
-        self._filter_x.reset()
-        self._filter_y.reset()
-        self._last_ts        = 0.0
-        self._lm_filters         = None      # cleared so it re-seeds on next detection
-        self._prev_screen_x      = None
-        self._prev_screen_y      = None
-        self._dwell_origin_x = None
-        self._dwell_origin_y = None
+
+        """Clear tracking history."""
+
+        self._last_raw_lm = None
+        self._has_last_raw = False
+
+        self._lm_velocity = None
+
+        self._lm_ema = None
+
+        self._last_screen_x = None
+
+        self._last_screen_y = None
+
+        self._pointing_active = False
+
+        self._fsm.dwell_origin = None
+
         self._x_history.clear()
-        self._swipe_cooldown     = 0
+
+        self._swipe_cooldown_until = 0.0
+
         self._prev_cursor_state  = "MOVE"
-        # Reset pointing-mode state so re-detection starts from a clean slate
-        self.is_pointing      = False
-        self._point_enter_ctr = 0
-        self._point_exit_ctr  = 0
-        self._point_blend     = 0.0
+
+        
+
+        self._state.skel_anchor_x = float(self._state.x)
+
+        self._state.skel_anchor_y = float(self._state.y)
+
         self._state.update(
+
             self._state.x, self._state.y, "MOVE", "NONE",
+
             hand_detected=False,
+
             dwell_progress=0.0,
+
             landmarks=[],
+
             hand_size=1.0,
+
             depth_z=1.0,
-            is_pointing=False,
+
         )
 
-
-
 # ===========================================================================
+
 # ── Camera helpers ────────────────────────────────────────────────────────
+
 # ===========================================================================
-
-LK_PARAMS = dict(
-    winSize=(45, 45),  # Expanded window to catch fast swipes
-    maxLevel=2,
-    criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03)
-)
-
-class FlowLandmark:
-    __slots__ = ['x', 'y']
-    def __init__(self, x: float, y: float):
-        self.x = x
-        self.y = y
 
 class CameraStream:
-    """Background thread for grabbing frames from the camera."""
+
+    """Thread-safe wrapper around cv2.VideoCapture.
+
+    FIX: Removed the background `update()` thread that raced with the main
+    camera loop on the same VideoCapture object.  OpenCV VideoCapture is NOT
+    thread-safe — two concurrent readers caused intermittent frame-read
+    failures under CPU load (fast hand movement → MediaPipe inference spikes),
+    which triggered the 10-fail reconnect path with exponential backoff
+    (2→4→8 s), producing the observed ~5 s camera stall.
+
+    Now the main camera loop is the sole reader.  read() calls
+    cap.read() directly — no background thread, no lock, no double copy.
+    """
+
     def __init__(self, camera_index: int, width: int, height: int, fps: int, stop_event: threading.Event) -> None:
+
         self.camera_index = camera_index
+
         self.width = width
+
         self.height = height
+
         self.fps = fps
+
         self.stop_event = stop_event
+
         self.cap = None
-        self.frame = None
-        self.ret = False
-        self.stopped = False
-        self.lock = threading.Lock()
 
     def start(self) -> bool:
+
         log.info("Opening webcam (index=%d) …", self.camera_index)
+
         backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_V4L2
+
         self.cap = cv2.VideoCapture(self.camera_index, backend)
+
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.width)
+
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+
         self.cap.set(cv2.CAP_PROP_FPS,          self.fps)
+
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+
         # Request MJPEG from the camera driver — delivers compressed frames over
+
         # USB, cutting bandwidth ~10× vs raw YUYV and reducing decode CPU on the Pi.
+
         # Falls back silently to YUYV if the camera doesn't support MJPEG.
+
         self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
 
         if not self.cap.isOpened():
+
             log.error("Cannot open webcam index=%d.", self.camera_index)
-            self.stop_event.set()
+
             return False
 
         log.info(
+
             "Webcam ready: %dx%d @ %.0f fps",
+
             self.cap.get(cv2.CAP_PROP_FRAME_WIDTH),
+
             self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT),
+
             self.cap.get(cv2.CAP_PROP_FPS),
+
         )
-        
-        self.ret, frame = self.cap.read()
-        if self.ret:
-            self.frame = frame.copy()
-        threading.Thread(target=self.update, daemon=True).start()
+
         return True
 
-    def update(self) -> None:
-        while not self.stopped and not self.stop_event.is_set():
-            if self.cap is not None:
-                ret, frame = self.cap.read()
-                with self.lock:
-                    self.ret = ret
-                    if ret:
-                        self.frame = frame.copy()
-                if not ret:
-                    time.sleep(0.01)
-                else:
-                    time.sleep(0.001)
-
     def read(self):
-        with self.lock:
-            if not self.ret or getattr(self, 'frame', None) is None:
-                return False, None
-            return self.ret, self.frame.copy()
+
+        if self.cap is None:
+
+            return False, None
+
+        return self.cap.read()
 
     def release(self) -> None:
-        self.stopped = True
+
         if self.cap is not None:
+
             self.cap.release()
 
+            self.cap = None
+
 def _open_camera(stop_event: threading.Event) -> Optional[CameraStream]:
+
     stream = CameraStream(CAMERA_INDEX, CAMERA_WIDTH, CAMERA_HEIGHT, TARGET_FPS, stop_event)
+
     if stream.start():
+
         return stream
+
     return None
 
-
 def _rate_limit(frame_interval: float, last_ts: float) -> None:
+
     """Sleep until the next frame deadline. Pure sleep — no spin-wait."""
+
     remaining = frame_interval - (time.perf_counter() - last_ts)
+
     if remaining > 0.001:          # only sleep if there's meaningful time left
+
         time.sleep(remaining)
 
 def validate_camera_access() -> bool:
+
     """
+
     Test camera access at startup.
+
     Provides helpful error messages for permission issues.
+
     """
+
     log.info(f"Checking camera access ({CAMERA_INDEX})...")
+
     try:
+
         cap = cv2.VideoCapture(CAMERA_INDEX)
+
         if not cap.isOpened():
+
             log.error(
+
                 "❌ Camera not accessible. On Linux, run:\n"
+
                 "   sudo usermod -aG video $USER\n"
+
                 "   # Then log out and back in for changes to take effect"
+
             )
+
             return False
+
         ret, frame = cap.read()
+
         cap.release()
+
         if not ret:
+
             log.error("❌ Camera found but cannot read frames. Check drivers/permissions.")
+
             return False
+
         log.info(f"✓ Camera accessible ({frame.shape})")
+
         return True
+
     except Exception as e:
+
         log.error(f"❌ Camera check failed: {e}")
+
         return False
 
-
-# ===========================================================================
-# ── Camera loop — Legacy solutions API ───────────────────────────────────
 # ===========================================================================
 
-def _camera_loop_legacy(
-    shared_state: GestureState, stop_event: threading.Event
-) -> None:
-    processor = GestureProcessor(shared_state)
+# ── Camera loop — Tasks API (mediapipe 0.10+) ────────────────────────────
 
-    with _hands_mod.Hands(
-        static_image_mode=False,
-        max_num_hands=4,
-        model_complexity=MODEL_COMPLEXITY,
-        min_detection_confidence=DETECT_CONFIDENCE,
-        min_tracking_confidence=TRACK_CONFIDENCE,
-    ) as hands:
-
-        cap = None
-        reconnect_attempt = 0
-        max_reconnect_attempts = 5
-        reconnect_delay = 2.0
-        frame_interval = 1.0 / TARGET_FPS
-        last_ts  = 0.0
-        skip_ctr = 0
-        flow_age = 0
-        miss_streak = 0
-        prev_gray = None
-        prev_pts = None
-        _last_mp_pts = None
-        geometry_poll_ctr = 0
-        read_fail_count = 0
-        
-        request_q = queue.Queue(maxsize=1)
-        result_q = queue.Queue()
-        
-        def mp_worker():
-            while not stop_event.is_set():
-                try:
-                    req = request_q.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                if req is None: break
-                req_seq, req_rgb, req_roi_info = req
-                
-                try:
-                    res = hands.process(req_rgb)
-                except Exception as e:
-                    log.error(f"Worker Error: {e}")
-                    res = None
-                    
-                while True:
-                    try: result_q.get_nowait()
-                    except queue.Empty: break
-                    
-                result_q.put((req_seq, res, req_roi_info))
-                
-        worker_thread = threading.Thread(target=mp_worker, daemon=True)
-        worker_thread.start()
-        
-        seq = 0
-        history_pts = {}
-        pipeline_mode = "ACTIVE"
-        prev_gate_gray = None
-        last_hand_seen_time = time.perf_counter()
-        last_mp_time = 0.0
-
-        while not stop_event.is_set():
-            try:
-                if cap is None:
-                    log.info(f"Opening camera {CAMERA_INDEX}...")
-                    cap = _open_camera(stop_event)
-                    if cap is None:
-                        raise RuntimeError(f"Camera {CAMERA_INDEX} not available")
-                    log.info("Camera opened successfully")
-                    reconnect_attempt = 0
-                    read_fail_count = 0
-                    with shared_state._lock:
-                        shared_state._hand_detected = False
-                        shared_state._gesture = "NONE"
-
-                current_fps = IDLE_FPS if pipeline_mode == "IDLE" else TARGET_FPS
-                frame_interval = 1.0 / current_fps
-                _rate_limit(frame_interval, last_ts)
-
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    read_fail_count += 1
-                    if read_fail_count > 10:
-                        raise RuntimeError("Camera returned consecutive bad frames")
-                    continue
-                read_fail_count = 0
-
-                geometry_poll_ctr += 1
-                if geometry_poll_ctr >= TARGET_FPS * 2:
-                    geometry_poll_ctr = 0
-                    display_manager.update()
-
-                now = time.perf_counter()
-                last_ts = now
-                seq += 1
-                
-                curr_gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                
-                # --- Tier 1: Presence Gate ---
-                small_gray = cv2.resize(curr_gray_full, GATE_RESOLUTION)
-                gate_active = True
-                if prev_gate_gray is not None:
-                    diff = cv2.absdiff(prev_gate_gray, small_gray)
-                    _, thresh = cv2.threshold(diff, GATE_DIFF_THRESH, 255, cv2.THRESH_BINARY)
-                    gate_active = (cv2.countNonZero(thresh) > GATE_PIXEL_THRESH)
-                prev_gate_gray = small_gray
-                
-                # --- Check Worker Results ---
-                try:
-                    res_seq, results, roi_info = result_q.get_nowait()
-                    if results and results.multi_hand_landmarks:
-                        last_hand_seen_time = now
-                        if pipeline_mode == "IDLE":
-                            log.info("Hand detected! Waking up to ACTIVE mode (%.0f fps).", TARGET_FPS)
-                            pipeline_mode = "ACTIVE"
-                        
-                        miss_streak = 0
-                        best_size = -1
-                        best_hand_lm = None
-                        for hlms in results.multi_hand_landmarks:
-                            lms = hlms.landmark
-                            _xy = np.array([[lm.x, lm.y] for lm in lms], dtype=np.float32)
-                            _mn = _xy.min(axis=0)
-                            _mx = _xy.max(axis=0)
-                            size = (_mx[0] - _mn[0]) * (_mx[1] - _mn[1])
-                            if size > best_size:
-                                best_size = size
-                                best_hand_lm = lms
-                                
-                        if best_hand_lm:
-                            roi_x0, roi_y0, roi_h, roi_w, w, h = roi_info
-                            pts = np.zeros((21, 1, 2), dtype=np.float32)
-                            full_lms = []
-                            for i, lm in enumerate(best_hand_lm):
-                                full_x = (lm.x * roi_w) + roi_x0
-                                full_y = (lm.y * roi_h) + roi_y0
-                                pts[i, 0, 0] = full_x
-                                pts[i, 0, 1] = full_y
-                                full_lms.append(FlowLandmark(full_x / w, full_y / h))
-                                
-                            # Late fusion offset
-                            if res_seq in history_pts and prev_pts is not None:
-                                delta = prev_pts - history_pts[res_seq]
-                                prev_pts = pts + delta
-                            else:
-                                prev_pts = pts
-                                
-                            _last_mp_pts = prev_pts.copy()
-                            prev_gray = curr_gray_full
-                            
-                            adjusted_lms = []
-                            for pt in prev_pts:
-                                adjusted_lms.append(FlowLandmark(float(pt[0][0])/w, float(pt[0][1])/h))
-                                
-                            processor.process(adjusted_lms)
-                            flow_age = 0
-                    else:
-                        miss_streak += 1
-                        if miss_streak >= MISS_TOLERANCE_FRAMES:
-                            processor.reset()
-                            prev_pts = None
-                            prev_gray = None
-                except queue.Empty:
-                    pass
-                
-                if pipeline_mode == "IDLE":
-                    if not gate_active and (now - last_mp_time) <= SAFETY_NET_INTERVAL:
-                        continue
-                    skip_ctr = 0
-                
-                current_skip_target = DWELL_SKIP_TARGET
-                skip_ctr += 1
-                flow_age += 1
-                
-                flow_successful = False
-                if prev_gray is not None and prev_pts is not None:
-                    if flow_age <= FLOW_MAX_AGE_FRAMES:
-                        curr_pts, status, err = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray_full, prev_pts, None, **LK_PARAMS)
-                        valid_points = status is not None and np.sum(status) >= 15
-                        if valid_points and skip_ctr <= DWELL_SKIP_TARGET:
-                            _CRITICAL_LMS = [0, 5, 8, 17]
-                            _critical_ok = all(status[ci][0] == 1 for ci in _CRITICAL_LMS)
-                            if not _critical_ok:
-                                flow_age = FLOW_MAX_AGE_FRAMES
-                            else:
-                                status_mask = (status == 1).flatten()
-                                deltas = curr_pts[status_mask] - prev_pts[status_mask]
-                                if len(deltas) > 0:
-                                    dx, dy = np.median(deltas, axis=0)[0]
-                                    motion = math.hypot(dx, dy)
-                                    if motion > MOTION_THRESHOLD:
-                                        current_skip_target = ACTIVE_SKIP_TARGET
-                                    if skip_ctr < current_skip_target:
-                                        rigid_pts = prev_pts + np.array([[[dx, dy]]], dtype=np.float32)
-                                        _drift_ok = True
-                                        if _last_mp_pts is not None:
-                                            max_drift = float(np.max(np.abs(rigid_pts - _last_mp_pts)))
-                                            if max_drift > FLOW_DRIFT_CLAMP_PX:
-                                                flow_age = FLOW_MAX_AGE_FRAMES
-                                                _drift_ok = False
-                                        if _drift_ok:
-                                            prev_gray = curr_gray_full
-                                            prev_pts = rigid_pts
-                                            h, w = frame.shape[:2]
-                                            flow_lms = [FlowLandmark(float(pt[0][0])/w, float(pt[0][1])/h) for pt in rigid_pts]
-                                            processor.process(flow_lms)
-                                            miss_streak = 0
-                                            flow_successful = True
-                                            history_pts[seq] = prev_pts.copy()
-                                            
-                # Cleanup history
-                history_pts.pop(seq - 30, None)
-                
-                if flow_successful:
-                    last_hand_seen_time = now
-                    if skip_ctr < current_skip_target:
-                        continue
-                        
-                # Dispatch to worker
-                skip_ctr = 0
-                frame.flags.writeable = False
-                h, w = frame.shape[:2]
-                roi_x0, roi_y0, roi_x1, roi_y1 = 0, 0, w, h
-                
-                if prev_pts is not None:
-                    palm_pts = prev_pts[[0, 1, 5, 9, 13, 17], 0, :]
-                    min_x, max_x = np.min(palm_pts[:, 0]), np.max(palm_pts[:, 0])
-                    min_y, max_y = np.min(palm_pts[:, 1]), np.max(palm_pts[:, 1])
-                    margin_x = max((max_x - min_x) * 1.5, 60.0)
-                    margin_y = max((max_y - min_y) * 1.5, 60.0)
-                    roi_x0 = max(0, int(min_x - margin_x))
-                    roi_y0 = max(0, int(min_y - margin_y))
-                    roi_x1 = min(w, int(max_x + margin_x))
-                    roi_y1 = min(h, int(max_y + margin_y))
-                    if (roi_x1 - roi_x0) < 50 or (roi_y1 - roi_y0) < 50:
-                        roi_x0, roi_y0, roi_x1, roi_y1 = 0, 0, w, h
-                        
-                roi_frame = frame[roi_y0:roi_y1, roi_x0:roi_x1]
-                roi_h, roi_w = roi_frame.shape[:2]
-                scale = 480.0 / max(roi_h, roi_w)
-                if scale < 1.0:
-                    small_frame = cv2.resize(roi_frame, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-                    rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-                else:
-                    rgb = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2RGB)
-                    
-                try:
-                    request_q.put_nowait((seq, rgb, (roi_x0, roi_y0, roi_h, roi_w, w, h)))
-                    last_mp_time = now
-                except queue.Full:
-                    pass
-                    
-                frame.flags.writeable = True
-                
-                if not flow_successful:
-                    if (now - last_hand_seen_time) >= IDLE_TIMEOUT_S and not gate_active:
-                        if pipeline_mode == "ACTIVE":
-                            log.info("No hand/motion detected for %.1fs. Dropping to IDLE mode (%d fps).", IDLE_TIMEOUT_S, IDLE_FPS)
-                            pipeline_mode = "IDLE"
-                            
-            except Exception as e:
-                log.error(f"Camera error: {e}")
-                if cap is not None:
-                    try: cap.release()
-                    except: pass
-                    cap = None
-                reconnect_attempt += 1
-                if reconnect_attempt > max_reconnect_attempts:
-                    log.critical("Camera reconnection failed.")
-                    stop_event.set()
-                    break
-                wait_time = reconnect_delay * (2 ** min(reconnect_attempt - 1, 3))
-                time.sleep(wait_time)
-
-    request_q.put(None) # kill worker
-    if cap is not None: cap.release()
-    log.info("Camera loop stopped.")
+# ===========================================================================
 
 def _camera_loop_tasks(
+
     shared_state: GestureState, stop_event: threading.Event
+
 ) -> None:
+
     from mediapipe.tasks import python as _mp_python
+
     from mediapipe.tasks.python import vision as _mp_vision
 
     _ensure_model()
 
     base_opts = _mp_python.BaseOptions(
-        model_asset_path=_MODEL_PATH
-    )
-    options   = _mp_vision.HandLandmarkerOptions(
-        base_options=base_opts,
-        running_mode=_mp_vision.RunningMode.VIDEO,
-        num_hands=4,
-        min_hand_detection_confidence=DETECT_CONFIDENCE,
-        min_hand_presence_confidence=PRESENCE_CONFIDENCE,
-        min_tracking_confidence=TRACK_CONFIDENCE,
+
+        model_asset_path=_MODEL_PATH,
+
     )
 
     processor = GestureProcessor(shared_state)
 
-    with _mp_vision.HandLandmarker.create_from_options(options) as landmarker:
-        cap = None
-        reconnect_attempt = 0
-        max_reconnect_attempts = 5
-        reconnect_delay = 2.0
-        frame_interval = 1.0 / TARGET_FPS
-        last_ts  = 0.0
-        skip_ctr = 0
-        flow_age = 0
-        miss_streak = 0
-        prev_gray = None
-        prev_pts = None
-        _last_mp_pts = None
-        geometry_poll_ctr = 0
-        read_fail_count = 0
-        
-        request_q = queue.Queue(maxsize=1)
-        result_q = queue.Queue()
-        
-        def mp_worker():
-            import mediapipe as mp
-            while not stop_event.is_set():
-                try:
-                    req = request_q.get(timeout=0.1)
-                except queue.Empty:
-                    continue
-                if req is None: break
-                req_seq, req_rgb, req_roi_info, ts_ms = req
-                
-                try:
-                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=req_rgb)
-                    res = landmarker.detect_for_video(mp_image, ts_ms)
-                except Exception as e:
-                    log.error(f"Worker Error: {e}")
-                    res = None
-                    
+    result_queue = queue.Queue(maxsize=1)
+
+    in_flight = False
+    in_flight_ts = 0.0
+
+    def _result_callback(result, output_image, timestamp_ms: int):
+
+        nonlocal in_flight
+
+        in_flight = False
+
+        try:
+
+            wl = result.hand_world_landmarks[0] if result.hand_world_landmarks else None
+
+            lm = result.hand_landmarks[0] if result.hand_landmarks else None
+
+            # Drain old queue items if any, keep latest
+
+            try:
+
                 while True:
-                    try: result_q.get_nowait()
-                    except queue.Empty: break
-                    
-                result_q.put((req_seq, res, req_roi_info))
-                
-        worker_thread = threading.Thread(target=mp_worker, daemon=True)
-        worker_thread.start()
-        
-        seq = 0
-        history_pts = {}
-        pipeline_mode = "ACTIVE"
-        prev_gate_gray = None
-        last_hand_seen_time = time.perf_counter()
-        last_mp_time = 0.0
+
+                    result_queue.get_nowait()
+
+            except queue.Empty:
+
+                pass
+
+            result_queue.put_nowait((lm, wl))
+
+        except queue.Full:
+
+            pass
+
+    options   = _mp_vision.HandLandmarkerOptions(
+
+        base_options=base_opts,
+
+        running_mode=_mp_vision.RunningMode.LIVE_STREAM,
+
+        num_hands=1,
+
+        min_hand_detection_confidence=DETECT_CONFIDENCE,
+
+        min_hand_presence_confidence=PRESENCE_CONFIDENCE,
+
+        min_tracking_confidence=TRACK_CONFIDENCE,
+
+        result_callback=_result_callback,
+
+    )
+
+    with _mp_vision.HandLandmarker.create_from_options(options) as landmarker:
+
+        cap = None
+
+        reconnect_attempt = 0
+
+        max_reconnect_attempts = 5
+
+        reconnect_delay = 2.0
+
+        frame_interval = 1.0 / TARGET_FPS
+
+        last_ts  = 0.0
+
+        last_ts_ms = 0
+
+        geometry_poll_ctr = 0
+
+        read_fail_count = 0     # tolerate transient USB frame drops
+
+        last_hand_seen_ts = 0.0  # grace-period anchor for thermal throttle
 
         while not stop_event.is_set():
+
             try:
+
                 if cap is None:
+
                     log.info(f"Opening camera {CAMERA_INDEX}...")
+
                     cap = _open_camera(stop_event)
+
                     if cap is None:
+
                         raise RuntimeError(f"Camera {CAMERA_INDEX} not available")
+
                     log.info("Camera opened successfully")
+
                     reconnect_attempt = 0
+
                     read_fail_count = 0
+
+                    
+
                     with shared_state._lock:
+
                         shared_state._hand_detected = False
+
                         shared_state._gesture = "NONE"
 
-                current_fps = IDLE_FPS if pipeline_mode == "IDLE" else TARGET_FPS
-                frame_interval = 1.0 / current_fps
+                # Grace period: keep 20 FPS for 1.5s after losing the hand,
+                # preventing motion blur amplification and death spirals.
+                if shared_state.hand_detected:
+
+                    last_hand_seen_ts = time.perf_counter()
+
+                grace_active = (time.perf_counter() - last_hand_seen_ts) < 1.5
+
+                target_fps = 20.0 if (shared_state.hand_detected or grace_active) else 12.0
+
+                frame_interval = 1.0 / target_fps
+
                 _rate_limit(frame_interval, last_ts)
 
                 ret, frame = cap.read()
+
                 if not ret or frame is None:
+
                     read_fail_count += 1
+
                     if read_fail_count > 10:
-                        raise RuntimeError("Camera returned consecutive bad frames")
+
+                        raise RuntimeError(
+
+                            f"Camera returned {read_fail_count} consecutive "
+
+                            "bad frames — likely disconnected"
+
+                        )
+
                     continue
+
                 read_fail_count = 0
 
+                last_ts   = time.perf_counter()
+
+                # Windows-only dev convenience: cheap poll
+
                 geometry_poll_ctr += 1
-                if geometry_poll_ctr >= TARGET_FPS * 2:
+
+                if geometry_poll_ctr >= TARGET_FPS * 2:  # ~every 2 seconds
+
                     geometry_poll_ctr = 0
+
                     display_manager.update()
 
-                now = time.perf_counter()
-                last_ts = now
-                seq += 1
+                # Fast downscale for MediaPipe (320x240 for ultra-fast CPU inference)
+
+                small_frame = cv2.resize(frame, (320, 240), interpolation=cv2.INTER_LINEAR)
+
+                rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+                ts_ms    = int(time.perf_counter() * 1000)
+
+                if ts_ms <= last_ts_ms:
+
+                    ts_ms = last_ts_ms + 1
+
+                last_ts_ms = ts_ms
+
+                if not in_flight:
+
+                    in_flight = True
+
+                    in_flight_ts = time.perf_counter()
+
+                    try:
+                        landmarker.detect_async(mp_image, ts_ms)
+                    except Exception as e:
+                        log.warning("MediaPipe inference submission failed: %s", e)
+                        in_flight = False
+
                 
-                curr_gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                
-                small_gray = cv2.resize(curr_gray_full, GATE_RESOLUTION)
-                gate_active = True
-                if prev_gate_gray is not None:
-                    diff = cv2.absdiff(prev_gate_gray, small_gray)
-                    _, thresh = cv2.threshold(diff, GATE_DIFF_THRESH, 255, cv2.THRESH_BINARY)
-                    gate_active = (cv2.countNonZero(thresh) > GATE_PIXEL_THRESH)
-                prev_gate_gray = small_gray
-                
+
                 try:
-                    res_seq, results, roi_info = result_q.get_nowait()
-                    if results and results.hand_landmarks:
-                        last_hand_seen_time = now
-                        if pipeline_mode == "IDLE":
-                            log.info("Hand detected! Waking up to ACTIVE mode (%.0f fps).", TARGET_FPS)
-                            pipeline_mode = "ACTIVE"
-                        
-                        miss_streak = 0
-                        best_size = -1
-                        best_hand_lm = None
-                        for lms in results.hand_landmarks:
-                            _xy = np.array([[lm.x, lm.y] for lm in lms], dtype=np.float32)
-                            _mn = _xy.min(axis=0)
-                            _mx = _xy.max(axis=0)
-                            size = (_mx[0] - _mn[0]) * (_mx[1] - _mn[1])
-                            if size > best_size:
-                                best_size = size
-                                best_hand_lm = lms
-                                
-                        if best_hand_lm:
-                            roi_x0, roi_y0, roi_h, roi_w, w, h = roi_info
-                            pts = np.zeros((21, 1, 2), dtype=np.float32)
-                            full_lms = []
-                            for i, lm in enumerate(best_hand_lm):
-                                full_x = (lm.x * roi_w) + roi_x0
-                                full_y = (lm.y * roi_h) + roi_y0
-                                pts[i, 0, 0] = full_x
-                                pts[i, 0, 1] = full_y
-                                full_lms.append(FlowLandmark(full_x / w, full_y / h))
-                                
-                            if res_seq in history_pts and prev_pts is not None:
-                                delta = prev_pts - history_pts[res_seq]
-                                prev_pts = pts + delta
-                            else:
-                                prev_pts = pts
-                                
-                            _last_mp_pts = prev_pts.copy()
-                            prev_gray = curr_gray_full
-                            
-                            adjusted_lms = []
-                            for pt in prev_pts:
-                                adjusted_lms.append(FlowLandmark(float(pt[0][0])/w, float(pt[0][1])/h))
-                                
-                            processor.process(adjusted_lms)
-                            flow_age = 0
-                    else:
-                        miss_streak += 1
-                        if miss_streak >= MISS_TOLERANCE_FRAMES:
-                            processor.reset()
-                            prev_pts = None
-                            prev_gray = None
+
+                    while True:
+
+                        lm, wl = result_queue.get_nowait()
+
+                        if lm:
+
+                            processor.process(lm, wl)
+
+                        else:
+
+                            processor.miss()
+
                 except queue.Empty:
+
                     pass
-                
-                if pipeline_mode == "IDLE":
-                    if not gate_active and (now - last_mp_time) <= SAFETY_NET_INTERVAL:
-                        continue
-                    skip_ctr = 0
-                
-                current_skip_target = DWELL_SKIP_TARGET
-                skip_ctr += 1
-                flow_age += 1
-                
-                flow_successful = False
-                if prev_gray is not None and prev_pts is not None:
-                    if flow_age <= FLOW_MAX_AGE_FRAMES:
-                        curr_pts, status, err = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray_full, prev_pts, None, **LK_PARAMS)
-                        valid_points = status is not None and np.sum(status) >= 15
-                        if valid_points and skip_ctr <= DWELL_SKIP_TARGET:
-                            _CRITICAL_LMS = [0, 5, 8, 17]
-                            _critical_ok = all(status[ci][0] == 1 for ci in _CRITICAL_LMS)
-                            if not _critical_ok:
-                                flow_age = FLOW_MAX_AGE_FRAMES
-                            else:
-                                status_mask = (status == 1).flatten()
-                                deltas = curr_pts[status_mask] - prev_pts[status_mask]
-                                if len(deltas) > 0:
-                                    dx, dy = np.median(deltas, axis=0)[0]
-                                    motion = math.hypot(dx, dy)
-                                    if motion > MOTION_THRESHOLD:
-                                        current_skip_target = ACTIVE_SKIP_TARGET
-                                    if skip_ctr < current_skip_target:
-                                        rigid_pts = prev_pts + np.array([[[dx, dy]]], dtype=np.float32)
-                                        _drift_ok = True
-                                        if _last_mp_pts is not None:
-                                            max_drift = float(np.max(np.abs(rigid_pts - _last_mp_pts)))
-                                            if max_drift > FLOW_DRIFT_CLAMP_PX:
-                                                flow_age = FLOW_MAX_AGE_FRAMES
-                                                _drift_ok = False
-                                        if _drift_ok:
-                                            prev_gray = curr_gray_full
-                                            prev_pts = rigid_pts
-                                            h, w = frame.shape[:2]
-                                            flow_lms = [FlowLandmark(float(pt[0][0])/w, float(pt[0][1])/h) for pt in rigid_pts]
-                                            processor.process(flow_lms)
-                                            miss_streak = 0
-                                            flow_successful = True
-                                            history_pts[seq] = prev_pts.copy()
-                                            
-                history_pts.pop(seq - 30, None)
-                
-                if flow_successful:
-                    last_hand_seen_time = now
-                    if skip_ctr < current_skip_target:
-                        continue
-                        
-                skip_ctr = 0
-                frame.flags.writeable = False
-                h, w = frame.shape[:2]
-                roi_x0, roi_y0, roi_x1, roi_y1 = 0, 0, w, h
-                
-                if prev_pts is not None:
-                    palm_pts = prev_pts[[0, 1, 5, 9, 13, 17], 0, :]
-                    min_x, max_x = np.min(palm_pts[:, 0]), np.max(palm_pts[:, 0])
-                    min_y, max_y = np.min(palm_pts[:, 1]), np.max(palm_pts[:, 1])
-                    margin_x = max((max_x - min_x) * 1.5, 60.0)
-                    margin_y = max((max_y - min_y) * 1.5, 60.0)
-                    roi_x0 = max(0, int(min_x - margin_x))
-                    roi_y0 = max(0, int(min_y - margin_y))
-                    roi_x1 = min(w, int(max_x + margin_x))
-                    roi_y1 = min(h, int(max_y + margin_y))
-                    if (roi_x1 - roi_x0) < 50 or (roi_y1 - roi_y0) < 50:
-                        roi_x0, roi_y0, roi_x1, roi_y1 = 0, 0, w, h
-                        
-                roi_frame = frame[roi_y0:roi_y1, roi_x0:roi_x1]
-                roi_h, roi_w = roi_frame.shape[:2]
-                scale = 480.0 / max(roi_h, roi_w)
-                if scale < 1.0:
-                    small_frame = cv2.resize(roi_frame, (0, 0), fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
-                    rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-                else:
-                    rgb = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2RGB)
-                    
-                try:
-                    ts_ms = int(time.time() * 1000)
-                    request_q.put_nowait((seq, rgb, (roi_x0, roi_y0, roi_h, roi_w, w, h), ts_ms))
-                    last_mp_time = now
-                except queue.Full:
-                    pass
-                    
-                frame.flags.writeable = True
-                
-                if not flow_successful:
-                    if (now - last_hand_seen_time) >= IDLE_TIMEOUT_S and not gate_active:
-                        if pipeline_mode == "ACTIVE":
-                            log.info("No hand/motion detected for %.1fs. Dropping to IDLE mode (%d fps).", IDLE_TIMEOUT_S, IDLE_FPS)
-                            pipeline_mode = "IDLE"
-                            
+
             except Exception as e:
+
                 log.error(f"Camera error: {e}")
-                import traceback
-                traceback.print_exc()
+
                 if cap is not None:
-                    try: cap.release()
-                    except: pass
+
+                    try:
+
+                        cap.release()
+
+                    except Exception:
+
+                        pass
+
                     cap = None
+
+                    
+
                 reconnect_attempt += 1
+
                 if reconnect_attempt > max_reconnect_attempts:
-                    log.critical("Camera reconnection failed.")
+
+                    log.critical(f"Camera reconnection failed after {max_reconnect_attempts} attempts.")
+
+                    log.critical("Giving up. Check camera hardware/permissions.")
+
                     stop_event.set()
+
                     break
+
+                    
+
                 wait_time = reconnect_delay * (2 ** min(reconnect_attempt - 1, 3))
+
+                log.info(f"Retrying camera in {wait_time:.1f}s (attempt {reconnect_attempt})")
+
                 time.sleep(wait_time)
 
-    request_q.put(None) # kill worker
-    if cap is not None: cap.release()
+    if cap is not None:
+
+        cap.release()
+
     log.info("Camera loop stopped.")
 
+# ===========================================================================
 
-class _WebSocketServer:
-    def __init__(self, shared_state):
-        self._state = shared_state
-        self._stop = threading.Event()
-        self._loop = None
-        self._thread = None
-        
-    def start(self):
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        
-    def stop(self):
-        self._stop.set()
-        if self._loop is not None:
-            self._loop.call_soon_threadsafe(self._loop.stop)
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-            
-    async def _handler(self, websocket):
-        while not self._stop.is_set():
-            try:
-                payload = self._state.to_json()
-                await websocket.send(payload)
-                await asyncio.sleep(1.0 / TARGET_FPS)
-            except websockets.ConnectionClosed:
-                break
-            except Exception as e:
-                log.error("WebSocket server error: %s", e)
-                break
-                
-    async def _serve(self):
-        try:
-            async with websockets.serve(self._handler, WS_HOST, WS_PORT):
-                while not self._stop.is_set():
-                    await asyncio.sleep(0.5)
-        except Exception as e:
-            log.error("WebSocket serve error: %s", e)
-            
-    def _run(self):
-        import asyncio
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        try:
-            self._loop.run_until_complete(self._serve())
-        except Exception as e:
-            log.error("WebSocket loop error: %s", e)
-        finally:
-            self._loop.close()
+# ── Camera thread dispatcher ──────────────────────────────────────────────
 
-def start_engine() -> None:
-    # ── Set Process Priority to HIGH ──
+# ===========================================================================
+
+def camera_loop(
+
+    shared_state: GestureState, stop_event: threading.Event
+
+) -> None:
+
+    _camera_loop_tasks(shared_state, stop_event)
+
+# ===========================================================================
+
+# ── WebSocket server ──────────────────────────────────────────────────────
+
+# ===========================================================================
+
+_connected_clients: set = set()
+
+async def ws_handler(websocket) -> None:
+
+    log.info("Client connected: %s", websocket.remote_address)
+
+    _connected_clients.add(websocket)
+
     try:
-        import psutil
-        p = psutil.Process(os.getpid())
-        if hasattr(psutil, "HIGH_PRIORITY_CLASS"):
-            p.nice(psutil.HIGH_PRIORITY_CLASS)
-        else:
-            p.nice(-10)
-    except Exception as e:
-        log.warning("Could not set process priority: %s", e)
+
+        # overlay.py pushes {"type": "geometry", "width": W, "height": H}
+
+        # on connect and whenever the OS reports a rotation/resolution
+
+        # change. This is the authoritative geometry path — see
+
+        # DisplayManager.set_external_geometry() for why.
+
+        async for raw in websocket:
+
+            try:
+
+                msg = json.loads(raw)
+
+            except json.JSONDecodeError:
+
+                continue
+
+            if msg.get("type") == "geometry":
+
+                try:
+
+                    w = int(msg["width"])
+
+                    h = int(msg["height"])
+
+                except (KeyError, TypeError, ValueError):
+
+                    continue
+
+                if display_manager.set_external_geometry(w, h):
+
+                    log.info("Geometry received from overlay.py: %dx%d", w, h)
+
+    finally:
+
+        _connected_clients.discard(websocket)
+
+        log.info("Client disconnected: %s", websocket.remote_address)
+
+async def broadcast_loop(
+
+    shared_state: GestureState, stop_event: threading.Event
+
+) -> None:
+
+    interval = 1.0 / TARGET_FPS
+
+    loop = asyncio.get_running_loop()
+
+    while not stop_event.is_set():
+
+        start = loop.time()
+
+        if _connected_clients:
+
+            # Only serialise when at least one client is connected
+
+            payload = shared_state.to_json()
+
+            await asyncio.gather(
+
+                *[_send_safe(ws, payload) for ws in list(_connected_clients)],
+
+                return_exceptions=True,
+
+            )
+
+        elapsed = loop.time() - start
+
+        await asyncio.sleep(max(0.0, interval - elapsed))
+
+async def _send_safe(ws, payload: str) -> bool:
+
+    """Send payload to one WS client.  Returns False if the client is dead.
+
+    FIX: Dead clients are now removed from _connected_clients on failure
+    instead of silently accumulating.  Previously, every broadcast iteration
+    (60 FPS) would retry sends to zombie connections, wasting CPU and
+    potentially starving the qasync event loop that also drives the Qt
+    overlay timer.
+    """
+
+    try:
+
+        await ws.send(payload)
+
+        return True
+
+    except Exception:
+
+        _connected_clients.discard(ws)
+
+        try:
+
+            await ws.close()
+
+        except Exception:
+
+            pass
+
+        return False
+
+async def run_server(
+
+    shared_state: GestureState, stop_event: threading.Event
+
+) -> None:
+
+    log.info("WebSocket server starting on ws://%s:%d", WS_HOST, WS_PORT)
+
+    async with websockets.serve(ws_handler, WS_HOST, WS_PORT):
+
+        log.info("WebSocket server ready.")
+
+        await broadcast_loop(shared_state, stop_event)
+
+# ===========================================================================
+
+# ── Entry Point ───────────────────────────────────────────────────────────
+
+# ===========================================================================
+
+def main() -> None:
+
+    log.info("Starting engine. Camera and display will initialize shortly.")
+
+    # Validate camera BEFORE spinning up threads
+
+    if not validate_camera_access():
+
+        raise SystemExit("Camera initialization failed")
 
     shared_state = GestureState()
-    stop_event = threading.Event()
 
-    server = _WebSocketServer(shared_state)
-    server.start()
+    stop_event   = threading.Event()
 
-    log.info("Starting engine...")
+    # ── Camera thread ──────────────────────────────────────────────────
+
+    cam_thread = threading.Thread(
+
+        target=camera_loop,
+
+        args=(shared_state, stop_event),
+
+        name="CameraThread",
+
+        daemon=True,
+
+    )
+
+    cam_thread.start()
+
+    # ── GUI & Asyncio integration ──────────────────────────────────────
+
     try:
-        if _USE_TASKS_API:
-            _camera_loop_tasks(shared_state, stop_event)
-        else:
-            _camera_loop_legacy(shared_state, stop_event)
-    except KeyboardInterrupt:
-        log.info("KeyboardInterrupt received. Shutting down gracefully...")
-    finally:
+
+        from PyQt5.QtWidgets import QApplication
+
+        import qasync
+
+        from overlay import OverlayWindow
+
+    except ImportError as e:
+
+        log.critical(f"Missing UI dependency: {e}. Please install PyQt5 and qasync.")
+
         stop_event.set()
-        server.stop()
-        log.info("Engine shutdown complete.")
+
+        cam_thread.join()
+
+        sys.exit(1)
+
+    if sys.platform != "win32":
+
+        os.environ.setdefault("QT_XCB_NATIVE_PAINTING", "1")
+
+        os.environ.setdefault("LIBGL_ALWAYS_SOFTWARE", "0")
+
+        os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.*=false")
+
+    app = QApplication(sys.argv)
+
+    app.setApplicationName("GestureEngine")
+
+    # Set qasync as the asyncio event loop
+
+    loop = qasync.QEventLoop(app)
+
+    asyncio.set_event_loop(loop)
+
+    # Initialize the OverlayWindow (connects it directly to the shared_state)
+
+    def geometry_changed(w: int, h: int) -> None:
+
+        display_manager.set_external_geometry(w, h)
+
+        log.info(f"Display resolution updated to {w}x{h}")
+
+        
+
+    window = OverlayWindow(shared_state, geometry_callback=geometry_changed)
+
+    window.show()
+
+    # Start the lazy WS server on the qasync loop
+
+    loop.create_task(run_server(shared_state, stop_event))
+
+    log.info("Running with unified qasync event loop. Press Ctrl+C in terminal to stop.")
+
+    try:
+
+        with loop:
+
+            loop.run_forever()
+
+    except KeyboardInterrupt:
+
+        log.info("Shutdown requested (Ctrl+C).")
+
+    finally:
+
+        stop_event.set()
+
+        cam_thread.join(timeout=3.0)
+
+        log.info("Engine stopped cleanly.")
 
 if __name__ == "__main__":
-    start_engine()
+
+    main()

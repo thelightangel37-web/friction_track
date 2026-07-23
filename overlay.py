@@ -37,6 +37,8 @@ import json
 import os
 import sys
 import threading
+import math
+import time
 from typing import List, Optional, Tuple
 
 # ── Ensure Qt finds the display on Raspberry Pi ─────────────────────────────
@@ -53,7 +55,7 @@ if sys.platform != "win32":
 
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QThread, QPointF
 from PyQt5.QtGui import (
-    QColor, QPainter, QPen, QBrush, QFont, QRadialGradient, QImage,
+    QColor, QPainter, QPen, QBrush, QFont, QRadialGradient,
 )
 from PyQt5.QtWidgets import QApplication, QWidget
 
@@ -63,8 +65,8 @@ import websockets
 # ── Configuration ─────────────────────────────────────────────────────────
 # ===========================================================================
 
-WS_URI        = "ws://127.0.0.1:8765"
-RECONNECT_SEC = 0.5       # seconds between reconnect attempts
+WS_URI        = "ws://localhost:8765"
+RECONNECT_SEC = 1.5       # seconds between reconnect attempts
 REFRESH_MS    = 16        # ~60 fps repaint timer
 
 # Landmark fade speed (0-1): higher = snappier appear/disappear
@@ -89,21 +91,15 @@ HAND_CONNECTIONS: List[Tuple[int, int]] = [
     (5, 9), (9, 13), (13, 17),
 ]
 
-# Skeleton colours are computed dynamically based on background brightness
-# (see _get_adaptive_skeleton_colors). These fallbacks are used before the
-# first background sample is available.
-_DOT_COLOR_DARK  = QColor(240, 245, 255, 240)   # near-white core for dark BG
-_GLOW_COLOR_DARK = QColor(200, 215, 255,  55)   # outer glow for dark BG
-_LINE_COLOR_DARK = QColor(210, 225, 255,  85)   # skeleton lines for dark BG
+# Fixed high-contrast skeleton palette.
+# Near-white core with thick black glove outline ensures visibility on any background.
+# No screen-grab or dynamic luminance sampling required.
 
-_DOT_COLOR_LIGHT  = QColor( 30,  30,  50, 230)  # near-black core for light BG
-_GLOW_COLOR_LIGHT = QColor( 20,  20,  60,  70)  # outer glow for light BG
-_LINE_COLOR_LIGHT = QColor( 10,  10,  40,  90)  # skeleton lines for light BG
-
-# ── Vivid lime-green for the dwell charging arc ────────────────────────────
-# #39FF14 / hue 107°  — highest attention-grab in the green family
-_DWELL_GREEN_BASE = QColor( 57, 255,  20)   # vivid neon green
-_DWELL_TRACK      = QColor( 57, 255,  20,  45)  # faint track ring
+_DWELL_GREEN_BASE   = QColor( 57, 255,  20)   # vivid neon green
+_DWELL_TRACK        = QColor( 57, 255,  20,  45)  # faint track ring
+_DWELL_ARC_RADIUS   = 44      # radius of the progress circle (px)
+_DWELL_PEN_WIDTH    = 10.0    # bold stroke width for charging arc (px)
+_DWELL_BORDER_WIDTH = 13.0    # stroke width of black contrast border (px)
 
 # Finger tip indices — drawn 2 px larger, same colour
 _FINGERTIPS = {4, 8, 12, 16, 20}
@@ -113,85 +109,7 @@ _FINGERTIPS = {4, 8, 12, 16, 20}
 # ── WebSocket client thread ───────────────────────────────────────────────
 # ===========================================================================
 
-class _WSThread(QThread):
-    """
-    Runs an asyncio WebSocket client on a background QThread.
-    Emits data_received(dict) on every valid message.
-    Emits connection_changed(bool) when the connection state changes.
-    """
 
-    data_received       = pyqtSignal(dict)
-    connection_changed  = pyqtSignal(bool)
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._stop = threading.Event()
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._ws = None  # currently-active connection, if any
-
-    def stop(self) -> None:
-        self._stop.set()
-
-    def send_geometry(self, w: int, h: int) -> None:
-        """
-        Push the Qt-verified screen geometry to gesture_engine.py.
-
-        This is the authoritative geometry path: the engine's own OS-level
-        detection (ctypes.windll) only works on Windows and is a no-op on
-        this Raspberry Pi/Linux deployment, so it relies entirely on us for
-        correct width/height. Safe to call from the Qt (main) thread — hands
-        off to the background asyncio loop via run_coroutine_threadsafe.
-        """
-        if self._loop is None:
-            return
-        payload = json.dumps({"type": "geometry", "width": int(w), "height": int(h)})
-        try:
-            asyncio.run_coroutine_threadsafe(self._send(payload), self._loop)
-        except RuntimeError:
-            pass  # loop not running yet / already closed
-
-    async def _send(self, payload: str) -> None:
-        if self._ws is not None:
-            try:
-                await self._ws.send(payload)
-            except Exception:
-                pass
-
-    def run(self) -> None:
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        try:
-            self._loop.run_until_complete(self._main())
-        finally:
-            self._loop.close()
-
-    async def _main(self) -> None:
-        while not self._stop.is_set():
-            try:
-                async with websockets.connect(
-                    WS_URI,
-                    open_timeout=3,
-                    ping_interval=5,
-                    ping_timeout=10,
-                ) as ws:
-                    self._ws = ws
-                    self.connection_changed.emit(True)
-                    async for raw in ws:
-                        if self._stop.is_set():
-                            return
-                        try:
-                            self.data_received.emit(json.loads(raw))
-                        except json.JSONDecodeError:
-                            pass
-            except Exception:
-                pass  # reconnect silently
-            finally:
-                self._ws = None
-
-            self.connection_changed.emit(False)
-
-            if not self._stop.is_set():
-                await asyncio.sleep(RECONNECT_SEC)
 
 
 # ===========================================================================
@@ -206,17 +124,24 @@ class OverlayWindow(QWidget):
     events through so it never blocks interaction with the underlying app.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, shared_state=None, geometry_callback=None) -> None:
         super().__init__()
+        self._shared_state = shared_state
+        self._geometry_callback = geometry_callback
 
         # ── Window setup ──────────────────────────────────────────────────
-        self.setWindowFlags(
-            Qt.FramelessWindowHint          |
-            Qt.WindowStaysOnTopHint         |
-            Qt.X11BypassWindowManagerHint   |  # Bypasses Xorg WM entirely so it never steals focus
-            Qt.Tool                         |  # required for WindowTransparentForInput
-            Qt.WindowTransparentForInput       # X11 input region set to empty
+        flags = (
+            Qt.FramelessWindowHint |
+            Qt.WindowStaysOnTopHint |
+            Qt.Tool |
+            Qt.WindowTransparentForInput
         )
+        import sys
+        if sys.platform != "win32":
+            flags |= Qt.X11BypassWindowManagerHint
+            
+        self.setWindowFlags(flags)
+        
         self.setAttribute(Qt.WA_TranslucentBackground,    True)
         self.setAttribute(Qt.WA_NoSystemBackground,       True)
         # Belt-and-suspenders: Qt's own event passthrough (covers XWayland edge cases)
@@ -248,7 +173,9 @@ class OverlayWindow(QWidget):
         self._cursor_state:   str               = "MOVE"
         self._cursor_x:       int               = 0
         self._cursor_y:       int               = 0
-        self._connected:      bool              = False
+        self._skel_anchor_x:  float             = 0.0
+        self._skel_anchor_y:  float             = 0.0
+        self._connected:      bool              = True
         self._dwell_progress: float             = 0.0   # 0.0 → 1.0 charging arc
         self._depth_z:        float             = 1.0   # physical depth scale factor
 
@@ -268,17 +195,13 @@ class OverlayWindow(QWidget):
         self._ghost_protect:      int   = 0     # frames to ignore hand_detected=False after click
         self._new_data:           bool  = False # track if new data arrived
 
-        # Skeleton stabilization — anchor smoothing + bone-length consistency
-        self._prev_anchor_x:  float = -1.0
-        self._prev_anchor_y:  float = -1.0
-        self._prev_bone_lengths: dict = {}  # (a,b) -> length in pixels
 
 
         # ── WebSocket ─────────────────────────────────────────────────────
-        self._ws = _WSThread()
-        self._ws.data_received.connect(self._on_data)
-        self._ws.connection_changed.connect(self._on_connect)
-        self._ws.start()
+        # WSThread removed. State is read directly in _tick().
+        if self._geometry_callback:
+            geo = self._screen.geometry()
+            self._geometry_callback(geo.width(), geo.height())
 
         # ── Repaint timer ─────────────────────────────────────────────────
         self._timer = QTimer(self)
@@ -295,12 +218,9 @@ class OverlayWindow(QWidget):
 
     def _on_connect(self, connected: bool) -> None:
         self._connected = connected
-        if connected:
-            # The engine starts with a hardcoded placeholder and cannot
-            # reliably detect the real screen itself on this platform — send
-            # it the true geometry the instant we (re)connect.
+        if connected and self._geometry_callback:
             geo = self._screen.geometry()
-            self._ws.send_geometry(geo.width(), geo.height())
+            self._geometry_callback(geo.width(), geo.height())
 
     def _on_screen_geometry_changed(self, geo) -> None:
         """Fires on QScreen rotation / resolution change (not on window resize).
@@ -318,64 +238,58 @@ class OverlayWindow(QWidget):
         self._pending_geo = None
         geo = self._screen.geometry()   # re-read for final stable value
         self.setGeometry(geo)
-        self._ws.send_geometry(geo.width(), geo.height())
+        if self._geometry_callback:
+            self._geometry_callback(geo.width(), geo.height())
 
     def _on_data(self, data: dict) -> None:
         prev_state            = self._cursor_state
-        
-        new_lms = data.get("landmarks", [])
-        new_x = data.get("x", 0)
-        new_y = data.get("y", 0)
-        new_dwell = data.get("dwell_progress", 0.0)
-        new_detect = data.get("hand_detected", False)
-        
-        if (self._landmarks != new_lms or 
-            self._cursor_x != new_x or 
-            self._cursor_y != new_y or 
-            self._dwell_progress != new_dwell or
-            self._hand_detected != new_detect):
+        new_hand_detected     = data.get("hand_detected", False)
+        new_state             = data.get("state", "MOVE")
+        new_x                 = data.get("x", 0)
+        new_y                 = data.get("y", 0)
+        new_skel_x            = data.get("skel_anchor_x", 0)
+        new_skel_y            = data.get("skel_anchor_y", 0)
+        new_progress          = data.get("dwell_progress", 0.0)
+
+        if (new_hand_detected != self._hand_detected or
+            new_state != self._cursor_state or
+            new_x != self._cursor_x or new_y != self._cursor_y or
+            new_skel_x != self._skel_anchor_x or new_skel_y != self._skel_anchor_y or
+            abs(new_progress - self._dwell_progress) > 0.001):
             self._new_data = True
-            
-        self._hand_detected   = new_detect
-        self._landmarks       = new_lms
+
+        self._hand_detected   = new_hand_detected
+        self._landmarks       = data.get("landmarks", [])
         self._gesture         = data.get("gesture", "NONE")
-        self._cursor_state    = data.get("state", "MOVE")
+        self._cursor_state    = new_state
         self._cursor_x        = new_x
         self._cursor_y        = new_y
-        self._dwell_progress  = new_dwell
+        self._skel_anchor_x   = new_skel_x
+        self._skel_anchor_y   = new_skel_y
+        self._dwell_progress  = new_progress
         self._depth_z         = data.get("depth_z", 1.0)
-        # Receive the complete mapping contract from the engine.
-        # scale_x / scale_y already embed both display resolution and active crop,
-        # so the overlay applies them directly without any geometry computation.
-        self._engine_scale_x  = data.get("scale_x",   self._engine_scale_x)
-        self._engine_scale_y  = data.get("scale_y",   self._engine_scale_y)
-        self._engine_rotation = data.get("rotation",  getattr(self, "_engine_rotation", 0))
-        self._cam_aspect      = data.get("cam_aspect", getattr(self, "_cam_aspect", 1.333))
-        # These now just echo back the geometry WE already pushed to the engine,
-        # but with one critical exception: XWayland lies about screen dimensions
-        # on rotated Raspberry Pi displays, reporting landscape (e.g. 1920x1080).
-        # The engine detects this and forces portrait (1080x1920). If the engine
-        # corrects our geometry to portrait, we must force-resize our window so 
-        # the transparent overlay isn't cropped.
-        self._engine_w = data.get("screen_width", data.get("display_w", self._engine_w))
-        self._engine_h = data.get("screen_height", data.get("display_h", self._engine_h))
-        
-        if abs(self._engine_rotation) == 90 and self.width() > self.height():
-            # Force window to portrait if it was erroneously created as landscape
-            self.setGeometry(0, 0, min(self.width(), self.height()), max(self.width(), self.height()))
+
+        self._engine_w = self.width()
+        self._engine_h = self.height()
+        self._cam_aspect = 640.0 / 480.0
 
         # Trigger burst animation the moment a click fires
         if self._cursor_state == "CLICK" and prev_state != "CLICK":
             self._click_pulse    = 1.0
             self._ghost_protect  = 20  # ~320 ms guard — covers xdotool disruption window
 
-        pass
-
     # ------------------------------------------------------------------
     # Animation tick
     # ------------------------------------------------------------------
 
     def _tick(self) -> None:
+        if self._shared_state:
+            snap = self._shared_state.snapshot()
+            self._on_data(snap)
+            self._connected = True
+        else:
+            self._connected = False
+            
 
         # Ghost-protect: ignore hand_detected=False for a few frames after a click.
         # The xdotool click can briefly disrupt MediaPipe, causing a spurious reset()
@@ -400,29 +314,27 @@ class OverlayWindow(QWidget):
             self._click_pulse = max(0.0, self._click_pulse - 0.08)
             animating = True
 
-        # Only update if we're animating, or if we have new data AND we're actually visible
-        if animating or (self._new_data and self._fade_alpha >= 0.01):
+        if animating or self._new_data:
             self.update()  # schedule repaint
-            
-        self._new_data = False
+            self._new_data = False
 
     # ------------------------------------------------------------------
     # Painting
     # ------------------------------------------------------------------
 
     def paintEvent(self, _event) -> None:  # noqa: N802
-        if self._fade_alpha < 0.01 and self._connected:
-            # Nothing visible and engine is connected — skip all drawing
+        if self._fade_alpha < 0.01:
+            # Nothing visible — skip all drawing
             return
+
+        w = self.width()
+        h = self.height()
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
 
-        if self._fade_alpha >= 0.01 and len(self._landmarks) == 21:
-            self._draw_skeleton(painter, self.width(), self.height())
-
-        if not self._connected:
-            self._draw_status(painter)
+        if self._fade_alpha > 0.01 and len(self._landmarks) == 21:
+            self._draw_skeleton(painter, w, h)
 
         painter.end()
 
@@ -434,7 +346,6 @@ class OverlayWindow(QWidget):
         Mirrors X so the visual matches screen direction.
         """
         return QPointF((1.0 - norm_x) * w, norm_y * h)
-
 
 
     # ------------------------------------------------------------------
@@ -455,53 +366,29 @@ class OverlayWindow(QWidget):
             return
 
         # ── Proportional Skeleton Mapping ──────────────────────────────────
-        # Anchor at Index Fingertip (LM 8)
+        # Anchor at Index Fingertip (LM 8) physical mapped position, not the active cursor!
         anchor_norm_x, anchor_norm_y = lms[8][0], lms[8][1]
         
-        # Lock the drawing anchor exactly to the OS cursor coordinates received from gesture_engine.
-        # This prevents the drawing and the real cursor from drifting apart if there is a mismatch
-        # between the hardcoded resolution in gesture_engine and the actual Qt window size.
-        anchor_screen_x = float(self._cursor_x)
-        anchor_screen_y = float(self._cursor_y)
-
-        # Smooth the anchor point to prevent micro-jitter from propagating
-        # to every landmark in the skeleton (all are rendered relative to anchor).
-        if self._prev_anchor_x >= 0:
-            anchor_screen_x = 0.85 * anchor_screen_x + 0.15 * self._prev_anchor_x
-            anchor_screen_y = 0.85 * anchor_screen_y + 0.15 * self._prev_anchor_y
-        self._prev_anchor_x = anchor_screen_x
-        self._prev_anchor_y = anchor_screen_y
+        # skel_anchor is the mapped pixel coordinate of the actual fingertip, before pointing projection.
+        anchor_screen_x = float(getattr(self, '_skel_anchor_x', self._cursor_x))
+        anchor_screen_y = float(getattr(self, '_skel_anchor_y', self._cursor_y))
         
-        # Auto-scale skeleton: bigger when far, smaller when close.
-        # Power > 1.0 over-compensates the natural landmark compression at distance,
-        # making the skeleton actively grow when the hand moves away from the camera.
-        # depth_z=0.5 (far) → scale ≈ 2.5x  (bigger for visibility)
-        # depth_z=1.0 (cal) → scale = 1.0x   (baseline)
-        # depth_z=2.0 (close)→ scale ≈ 0.4x  (smaller, less intrusive)
-        TARGET_SKEL_SIZE = 0.8   # Tune this to control overall hand size
-        SKELETON_SCALE = TARGET_SKEL_SIZE  # Disable dynamic depth scaling to prevent rubber-banding
-
         def clamp(v: float, lo: float, hi: float) -> float:
             return max(lo, min(hi, v))
 
-        # Presentation scale — NOT the cursor's interaction scale (scale_x/scale_y).
-        # Deliberately separate: this controls how big the hand LOOKS, independent
-        # of how sensitive the cursor is. Do not merge these two scales.
-        base_size = min(self._engine_w, self._engine_h)
-        cam_aspect = getattr(self, "_cam_aspect", 1.333)
-        rotation = getattr(self, "_engine_rotation", 0)
-        
-        if abs(rotation) == 90:
-            skel_scale_x = base_size / cam_aspect
-            skel_scale_y = base_size
-        else:
-            skel_scale_x = base_size
-            skel_scale_y = base_size / cam_aspect
+        TARGET_SKEL_SIZE = 1
+        raw_scale = TARGET_SKEL_SIZE / (max(0.6, self._depth_z) ** 0.8)
+        SKELETON_SCALE = clamp(raw_scale, 0.85, 1.15)
 
-        MAX_BONE_PX = base_size * 0.5  # defensive cap against a single bad frame
+        base_size = min(self._engine_w, self._engine_h)
+        skel_scale_x = base_size
+        skel_scale_y = base_size / getattr(self, "_cam_aspect", 1.333)
+
+        MAX_BONE_PX = base_size * 0.5
 
         px_lms = []
-        for nx, ny in lms:
+        for lm in lms:
+            nx, ny = lm[0], lm[1]
             dx_norm = nx - anchor_norm_x
             dy_norm = ny - anchor_norm_y
             
@@ -512,33 +399,7 @@ class OverlayWindow(QWidget):
             sy = anchor_screen_y + dy_px
             
             px_lms.append(QPointF(sx, sy))
-
-        # ── Bone-length consistency clamp ─────────────────────────────────
-        # If any bone stretches beyond 1.5× its previous length in a single
-        # frame, interpolate the child endpoint back toward the parent to
-        # prevent visual stretching from drifted landmark data.
-        if self._prev_bone_lengths:
-            for a, b in HAND_CONNECTIONS:
-                if a < len(px_lms) and b < len(px_lms):
-                    bone_len = ((px_lms[b].x() - px_lms[a].x()) ** 2 +
-                                (px_lms[b].y() - px_lms[a].y()) ** 2) ** 0.5
-                    key = (a, b)
-                    prev_len = self._prev_bone_lengths.get(key, bone_len)
-                    if prev_len > 1.0 and bone_len > prev_len * 1.5:
-                        # Clamp: move endpoint b toward a so bone = prev_len * 1.5
-                        ratio = (prev_len * 1.5) / max(bone_len, 0.001)
-                        new_x = px_lms[a].x() + (px_lms[b].x() - px_lms[a].x()) * ratio
-                        new_y = px_lms[a].y() + (px_lms[b].y() - px_lms[a].y()) * ratio
-                        px_lms[b] = QPointF(new_x, new_y)
-
-        # Update bone-length cache for next frame
-        new_bone_lengths = {}
-        for a, b in HAND_CONNECTIONS:
-            if a < len(px_lms) and b < len(px_lms):
-                bl = ((px_lms[b].x() - px_lms[a].x()) ** 2 +
-                      (px_lms[b].y() - px_lms[a].y()) ** 2) ** 0.5
-                new_bone_lengths[(a, b)] = bl
-        self._prev_bone_lengths = new_bone_lengths
+            
 
         # ── Connection lines — two-pass "glove" rendering ─────────────────
         # Pass 1: thick black stroke  →  the exterior glove surface
@@ -561,8 +422,11 @@ class OverlayWindow(QWidget):
         for i, pos in enumerate(px_lms):
             radius = 9 if i in _FINGERTIPS else 6
 
-            # Soft outer glow halo (Solid circle now)
-            painter.setBrush(QBrush(WHITE_GLOW))
+            # Soft outer glow halo
+            grad = QRadialGradient(pos, radius * 2)
+            grad.setColorAt(0.0, WHITE_GLOW)
+            grad.setColorAt(1.0, QColor(0, 0, 0, 0))
+            painter.setBrush(QBrush(grad))
             painter.drawEllipse(pos, radius * 2, radius * 2)
 
             # Black glove ring (slightly larger than white core)
@@ -575,38 +439,45 @@ class OverlayWindow(QWidget):
 
         # ── Dwell charging arc on index fingertip (LM 8) ─────────────────
         if len(lms) >= 9:
-            tip_pos = QPointF(self._cursor_x, self._cursor_y)
-            arc_r   = 38                     # radius of the progress ring
+            tip_pos = QPointF(anchor_screen_x, anchor_screen_y)
+            arc_r   = _DWELL_ARC_RADIUS
             rect_x  = int(tip_pos.x() - arc_r)
             rect_y  = int(tip_pos.y() - arc_r)
             rect_d  = arc_r * 2
+            pen_w   = _DWELL_PEN_WIDTH
 
-            # Track ring — faint green circle showing the dwell path
-            track_alpha = int(55 * alpha)
+            # Track ring — clean green circle showing the dwell path
+            track_alpha = int(120 * alpha)
             if track_alpha > 0:
                 track_col = QColor(_DWELL_TRACK)
                 track_col.setAlpha(track_alpha)
-                painter.setPen(QPen(track_col, 8.0, Qt.SolidLine, Qt.RoundCap))
+                painter.setPen(QPen(track_col, pen_w, Qt.SolidLine, Qt.RoundCap))
                 painter.setBrush(Qt.NoBrush)
-                painter.drawEllipse(int(tip_pos.x() - arc_r), int(tip_pos.y() - arc_r),
-                                    arc_r * 2, arc_r * 2)
+                painter.drawEllipse(rect_x, rect_y, rect_d, rect_d)
+
+            # Pulsing glow ring when dwell is actively charging
+            if self._dwell_progress > 0.01:
+                pulse = 0.5 + 0.5 * math.sin(time.time() * 6.0)  # ~1Hz breathing
+                glow_alpha = int((90 + 50 * pulse) * alpha)
+                glow_col = QColor(57, 255, 20, glow_alpha)
+                glow_pen = QPen(glow_col, pen_w, Qt.SolidLine, Qt.RoundCap)
+                painter.setPen(glow_pen)
+                painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(rect_x, rect_y, rect_d, rect_d)
 
             # Progress arc — vivid lime-green, sweeps clockwise from 12 o'clock
             if self._dwell_progress > 0.001:
                 span_deg  = self._dwell_progress * 360.0
-                # Green channel stays maxed; red/blue components pulse slightly
-                # to give a subtle brightness surge as the arc completes
-                red_val   = int(40  + 40  * self._dwell_progress)   # 40 → 80
-                blue_val  = int(10  + 30  * self._dwell_progress)   # 10 → 40
-                arc_alpha = int((0.55 + 0.45 * self._dwell_progress) * 255 * alpha)
+                red_val   = int(40  + 40  * self._dwell_progress)
+                blue_val  = int(10  + 30  * self._dwell_progress)
+                arc_alpha = int((0.70 + 0.30 * self._dwell_progress) * 255 * alpha)
                 arc_col   = QColor(red_val, 255, blue_val, arc_alpha)
-                pen_w     = 10.0 + self._dwell_progress * 4.0       # thickens as it fills
                 
                 start_angle = 90 * 16
                 span_angle  = -int(span_deg * 16)
                 
                 # Draw black border behind the arc for contrast
-                border_pen_w = pen_w + 4.0
+                border_pen_w = _DWELL_BORDER_WIDTH
                 border_col = QColor(0, 0, 0, int(210 * alpha))
                 painter.setPen(QPen(border_col, border_pen_w, Qt.SolidLine, Qt.RoundCap))
                 painter.setBrush(Qt.NoBrush)
@@ -614,13 +485,11 @@ class OverlayWindow(QWidget):
 
                 painter.setPen(QPen(arc_col, pen_w, Qt.SolidLine, Qt.RoundCap))
                 painter.setBrush(Qt.NoBrush)
-                # Qt angles: 0° = 3 o'clock, positive = counter-clockwise in 1/16°
-                # Start at 12 o'clock (90°), sweep clockwise (− span)
                 painter.drawArc(rect_x, rect_y, rect_d, rect_d, start_angle, span_angle)
 
         # ── CLICK burst ring ──────────────────────────────────────────
         if self._click_pulse > 0.01 and len(lms) >= 9:
-            tip_pos = QPointF(self._cursor_x, self._cursor_y)
+            tip_pos = QPointF(anchor_screen_x, anchor_screen_y)
             pulse_r     = 38 + (1.0 - self._click_pulse) * 50
             ring_alpha  = int(self._click_pulse * 220 * alpha)
             # Click burst ring matches the dwell green for visual coherence
@@ -631,48 +500,11 @@ class OverlayWindow(QWidget):
 
 
 
-    def _draw_status(self, painter: Optional[QPainter] = None) -> None:
-        """Small 'Connecting…' pill when gesture engine is not reachable."""
-        own = painter is None
-        if own:
-            painter = QPainter(self)
-            painter.setRenderHint(QPainter.Antialiasing)
-
-        msg  = "● Connecting to gesture engine…"
-        font = QFont("Sans Serif", 12)
-        font.setWeight(QFont.Medium)
-        painter.setFont(font)
-
-        fm      = painter.fontMetrics()
-        text_w  = fm.horizontalAdvance(msg)
-        text_h  = fm.height()
-        padding = 12
-        pill_w  = text_w + padding * 2
-        pill_h  = text_h + padding
-        x       = (self.width() - pill_w) // 2
-        y       = self.height() - 80 - pill_h
-
-        # Background pill
-        bg = QColor(20, 20, 30, 190)
-        painter.setBrush(QBrush(bg))
-        painter.setPen(Qt.NoPen)
-        painter.drawRoundedRect(x, y, pill_w, pill_h, pill_h // 2, pill_h // 2)
-
-        # Text
-        painter.setPen(QColor(160, 160, 180, 220))
-        painter.drawText(x + padding, y + padding // 2 + fm.ascent(), msg)
-
-        if own:
-            painter.end()
-
     # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        self._ws.stop()
-        self._ws.quit()
-        self._ws.wait(2000)
         super().closeEvent(event)
 
 
