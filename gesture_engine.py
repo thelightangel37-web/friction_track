@@ -1154,18 +1154,7 @@ class GestureState:
 
         depth_z: float = 1.0,
 
-        skel_anchor_x: Optional[float] = None,
-
-        skel_anchor_y: Optional[float] = None,
-
     ) -> None:
-
-        """Batch-write all gesture state under a single lock acquisition.
-
-        FIX: skel_anchor_x/y are now written here instead of as separate
-        property sets before update().  This eliminates 2 extra RLock
-        acquisitions per frame (~20 FPS × 2 = 40 lock ops/sec saved).
-        """
 
         with self._lock:
 
@@ -1529,14 +1518,6 @@ class GestureProcessor:
 
         self._last_screen_y: Optional[int] = None
 
-        # FIX: Pre-allocated buffers — avoid per-frame np.array() / np.full()
-        # allocations that caused GC pressure during fast hand movement.
-        self._raw_buf    = np.zeros((21, 3), dtype=np.float32)
-        self._world_buf  = np.zeros((21, 3), dtype=np.float32)
-        self._alpha_buf  = np.full((21, 1), 0.5, dtype=np.float32)
-        self._last_raw_lm_buf = np.zeros((21, 3), dtype=np.float32)
-        self._has_last_raw = False
-
         
 
         # evdev for linux native clicks
@@ -1575,22 +1556,13 @@ class GestureProcessor:
 
         # ── 1. Extract and Rotate Landmarks ─────────────────────────────────
 
-        # FIX: Fill pre-allocated buffers instead of creating new arrays per frame.
-        raw_lm_np = self._raw_buf
-        for i, lm in enumerate(lms):
-            raw_lm_np[i, 0] = lm.x
-            raw_lm_np[i, 1] = lm.y
-            raw_lm_np[i, 2] = getattr(lm, 'z', 0.0)
+        raw_lm_np = np.array([[lm.x, lm.y, getattr(lm, 'z', 0.0)] for lm in lms], dtype=np.float32)
 
         world_lm_np = None
 
         if world_lms:
 
-            world_lm_np = self._world_buf
-            for i, lm in enumerate(world_lms):
-                world_lm_np[i, 0] = lm.x
-                world_lm_np[i, 1] = lm.y
-                world_lm_np[i, 2] = getattr(lm, 'z', 0.0)
+            world_lm_np = np.array([[lm.x, lm.y, getattr(lm, 'z', 0.0)] for lm in world_lms], dtype=np.float32)
 
         _rotation = display_manager.rotation
 
@@ -1662,9 +1634,7 @@ class GestureProcessor:
 
                     alpha_val = float(np.clip(0.15 + (0.95 - 0.15) * (1.0 - np.exp(-3.0 * palm_speed)), 0.15, 0.95))
 
-                    # FIX: Reuse pre-allocated buffer instead of np.full() per frame
-                    self._alpha_buf[:] = alpha_val
-                    alphas = self._alpha_buf
+                    alphas = np.full((21, 1), alpha_val, dtype=np.float32)
 
                 else:
 
@@ -1672,8 +1642,8 @@ class GestureProcessor:
 
             else:
 
-                # FIX: Reuse pre-allocated buffer instead of np.zeros_like() per frame
                 self._lm_velocity = np.zeros_like(raw_lm_np)
+
                 alphas = 1.0
 
             if self._lm_ema is None or self._lm_ema.shape != raw_lm_np.shape:
@@ -1684,10 +1654,7 @@ class GestureProcessor:
 
                 self._lm_ema = alphas * raw_lm_np + (1.0 - alphas) * self._lm_ema
 
-            # FIX: Copy into pre-allocated buffer instead of allocating a new array
-            np.copyto(self._last_raw_lm_buf, raw_lm_np)
-            self._last_raw_lm = self._last_raw_lm_buf
-            self._has_last_raw = True
+            self._last_raw_lm = raw_lm_np.copy()
 
             self._last_ts = now
 
@@ -2058,7 +2025,6 @@ class GestureProcessor:
         """Clear tracking history."""
 
         self._last_raw_lm = None
-        self._has_last_raw = False
 
         self._lm_velocity = None
 
@@ -2108,18 +2074,7 @@ class GestureProcessor:
 
 class CameraStream:
 
-    """Thread-safe wrapper around cv2.VideoCapture.
-
-    FIX: Removed the background `update()` thread that raced with the main
-    camera loop on the same VideoCapture object.  OpenCV VideoCapture is NOT
-    thread-safe — two concurrent readers caused intermittent frame-read
-    failures under CPU load (fast hand movement → MediaPipe inference spikes),
-    which triggered the 10-fail reconnect path with exponential backoff
-    (2→4→8 s), producing the observed ~5 s camera stall.
-
-    Now the main camera loop is the sole reader.  read() calls
-    cap.read() directly — no background thread, no lock, no double copy.
-    """
+    """Background thread for grabbing frames from the camera."""
 
     def __init__(self, camera_index: int, width: int, height: int, fps: int, stop_event: threading.Event) -> None:
 
@@ -2134,6 +2089,14 @@ class CameraStream:
         self.stop_event = stop_event
 
         self.cap = None
+
+        self.frame = None
+
+        self.ret = False
+
+        self.stopped = False
+
+        self.lock = threading.Lock()
 
     def start(self) -> bool:
 
@@ -2177,23 +2140,59 @@ class CameraStream:
 
         )
 
+        
+
+        self.ret, frame = self.cap.read()
+
+        if self.ret:
+
+            self.frame = frame.copy()
+
+        threading.Thread(target=self.update, daemon=True).start()
+
         return True
+
+    def update(self) -> None:
+
+        frames_read = 0
+
+        while not self.stopped and not self.stop_event.is_set():
+
+            if self.cap is not None:
+
+                ret, frame = self.cap.read()
+
+                with self.lock:
+
+                    self.ret = ret
+
+                    if ret:
+
+                        self.frame = frame.copy()
+
+                        frames_read += 1
+
+                if not ret:
+
+                    time.sleep(0.01)
 
     def read(self):
 
-        if self.cap is None:
+        with self.lock:
 
-            return False, None
+            if not self.ret or getattr(self, 'frame', None) is None:
 
-        return self.cap.read()
+                return False, None
+
+            return self.ret, self.frame.copy()
 
     def release(self) -> None:
+
+        self.stopped = True
 
         if self.cap is not None:
 
             self.cap.release()
-
-            self.cap = None
 
 def _open_camera(stop_event: threading.Event) -> Optional[CameraStream]:
 
@@ -2456,6 +2455,10 @@ def _camera_loop_tasks(
 
                 last_ts_ms = ts_ms
 
+                if in_flight and (time.perf_counter() - in_flight_ts > 0.2):
+                    log.warning("MediaPipe callback timeout. Releasing in_flight lock.")
+                    in_flight = False
+
                 if not in_flight:
 
                     in_flight = True
@@ -2634,36 +2637,15 @@ async def broadcast_loop(
 
         await asyncio.sleep(max(0.0, interval - elapsed))
 
-async def _send_safe(ws, payload: str) -> bool:
-
-    """Send payload to one WS client.  Returns False if the client is dead.
-
-    FIX: Dead clients are now removed from _connected_clients on failure
-    instead of silently accumulating.  Previously, every broadcast iteration
-    (60 FPS) would retry sends to zombie connections, wasting CPU and
-    potentially starving the qasync event loop that also drives the Qt
-    overlay timer.
-    """
+async def _send_safe(ws, payload: str) -> None:
 
     try:
 
         await ws.send(payload)
 
-        return True
-
     except Exception:
 
-        _connected_clients.discard(ws)
-
-        try:
-
-            await ws.close()
-
-        except Exception:
-
-            pass
-
-        return False
+        pass
 
 async def run_server(
 
